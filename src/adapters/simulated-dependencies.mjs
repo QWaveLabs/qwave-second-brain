@@ -51,6 +51,7 @@ export class SimulatedDesktopVaultAdapter {
     this.desktopRoot = desktopRoot;
     this.failuresBeforeSuccess = failuresBeforeSuccess;
     this.ensureCalls = 0;
+    this.writeCalls = 0;
     this.createdVaults = 0;
     this.vaults = new Map();
   }
@@ -84,6 +85,39 @@ export class SimulatedDesktopVaultAdapter {
     return {
       exists: Boolean(files),
       files: files ? [...files.keys()] : [],
+      contents: files ? Object.fromEntries(files) : {},
+      simulated: true
+    };
+  }
+
+  async writeFiles({ path, files }) {
+    this.writeCalls += 1;
+    const vault = this.vaults.get(path);
+    if (!vault) {
+      throw new Error("Simulated vault does not exist.");
+    }
+    if (!files || typeof files !== "object" || Array.isArray(files)) {
+      throw new TypeError("files must be an object keyed by safe vault-relative paths.");
+    }
+
+    for (const [relativePath, content] of Object.entries(files)) {
+      if (
+        typeof relativePath !== "string"
+        || relativePath.length === 0
+        || relativePath.startsWith("/")
+        || relativePath.split("/").includes("..")
+      ) {
+        throw new TypeError("Foundation files must stay inside the simulated vault.");
+      }
+      if (typeof content !== "string") {
+        throw new TypeError("Foundation file content must be text.");
+      }
+      vault.set(relativePath, content);
+    }
+
+    return {
+      path,
+      files: [...vault.keys()],
       simulated: true
     };
   }

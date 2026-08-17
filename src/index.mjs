@@ -7,6 +7,13 @@ export {
 } from "./public/setup-session.mjs";
 
 export {
+  ONBOARDING_BATCHES,
+  continueOnboardingSession,
+  getOnboardingSessionStatus,
+  startOnboardingSession
+} from "./public/onboarding.mjs";
+
+export {
   FileStateStore,
   SimulatedDesktopVaultAdapter,
   SimulatedEnvironmentAdapter
