@@ -29,10 +29,11 @@ export class FileStateStore {
 }
 
 export class SimulatedEnvironmentAdapter {
-  constructor({ supported = true, summary = "Simulated private Mac environment", customerMessage } = {}) {
+  constructor({ supported = true, summary = "Simulated private Mac environment", customerMessage, sharedProfile = false } = {}) {
     this.supported = supported;
     this.summary = summary;
     this.customerMessage = customerMessage;
+    this.sharedProfile = sharedProfile;
     this.inspectCalls = 0;
   }
 
@@ -41,8 +42,76 @@ export class SimulatedEnvironmentAdapter {
     return {
       supported: this.supported,
       summary: this.summary,
-      customerMessage: this.customerMessage
+      customerMessage: this.customerMessage,
+      sharedProfile: this.sharedProfile
     };
+  }
+}
+
+/**
+ * Simulates only the observable macOS/Obsidian contract. It deliberately does
+ * not install software, read a real vault, or open a real application. A test
+ * may call simulateCustomerInstalledOfficialObsidian() between Setup Session
+ * resumes to model the customer completing the one official install action.
+ */
+export class SimulatedObsidianAdapter {
+  constructor({
+    installed = true,
+    official = true,
+    appPath = "/Applications/Obsidian.app",
+    existingVaults = [],
+    openFailuresBeforeSuccess = 0
+  } = {}) {
+    this.installed = installed;
+    this.official = official;
+    this.appPath = appPath;
+    this.existingVaults = structuredClone(existingVaults);
+    this.openFailuresBeforeSuccess = openFailuresBeforeSuccess;
+    this.inspectCalls = 0;
+    this.officialInstallActionCalls = 0;
+    this.installCalls = 0;
+    this.openCalls = 0;
+    this.openedVaultPaths = [];
+  }
+
+  async inspect() {
+    this.inspectCalls += 1;
+    return {
+      installed: this.installed,
+      official: this.official,
+      appPath: this.installed ? this.appPath : null,
+      existingVaults: structuredClone(this.existingVaults),
+      simulated: true
+    };
+  }
+
+  async createOfficialInstallAction({ downloadUrl }) {
+    this.officialInstallActionCalls += 1;
+    return {
+      kind: "official-download-and-install",
+      label: "Install Obsidian from the official page",
+      url: downloadUrl,
+      simulated: true
+    };
+  }
+
+  async verifyVaultOpen({ path }) {
+    this.openCalls += 1;
+    if (!this.installed || !this.official || this.openFailuresBeforeSuccess > 0) {
+      if (this.openFailuresBeforeSuccess > 0) this.openFailuresBeforeSuccess -= 1;
+      return { opened: false, path: null, simulated: true };
+    }
+    this.openedVaultPaths.push(path);
+    return { opened: true, path, simulated: true };
+  }
+
+  simulateCustomerInstalledOfficialObsidian() {
+    this.installed = true;
+    this.official = true;
+  }
+
+  getExistingVaults() {
+    return structuredClone(this.existingVaults);
   }
 }
 
@@ -52,8 +121,19 @@ export class SimulatedDesktopVaultAdapter {
     this.failuresBeforeSuccess = failuresBeforeSuccess;
     this.ensureCalls = 0;
     this.writeCalls = 0;
+    this.planCalls = 0;
     this.createdVaults = 0;
     this.vaults = new Map();
+  }
+
+  async planDesktopVault({ name }) {
+    this.planCalls += 1;
+    const path = `${this.desktopRoot}/${name}`;
+    return {
+      path,
+      exists: this.vaults.has(path),
+      simulated: true
+    };
   }
 
   async ensureVault({ name, homeContent, statusContent }) {

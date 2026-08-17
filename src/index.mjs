@@ -16,5 +16,11 @@ export {
 export {
   FileStateStore,
   SimulatedDesktopVaultAdapter,
-  SimulatedEnvironmentAdapter
+  SimulatedEnvironmentAdapter,
+  SimulatedObsidianAdapter
 } from "./adapters/simulated-dependencies.mjs";
+
+export {
+  MacOSDesktopVaultAdapter,
+  MacOSObsidianAdapter
+} from "./adapters/macos-dependencies.mjs";

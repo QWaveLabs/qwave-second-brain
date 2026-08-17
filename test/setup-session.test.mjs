@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -7,8 +7,12 @@ import test from "node:test";
 import {
   BOOTSTRAP_EXAMPLES,
   FileStateStore,
+  MacOSDesktopVaultAdapter,
+  MacOSObsidianAdapter,
+  SETUP_STAGES,
   SimulatedDesktopVaultAdapter,
   SimulatedEnvironmentAdapter,
+  SimulatedObsidianAdapter,
   continueSetupSession,
   getSetupSessionStatus,
   startSetupSession
@@ -18,11 +22,12 @@ async function withSessionFixture(run, options = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "qwave-second-brain-qwa138-"));
   const stateStore = new FileStateStore(path.join(directory, "private-state", "setup-session.json"));
   const environment = new SimulatedEnvironmentAdapter(options.environment);
+  const obsidian = new SimulatedObsidianAdapter(options.obsidian);
   const vault = new SimulatedDesktopVaultAdapter(options.vault);
-  const adapters = { environment, vault };
+  const adapters = { environment, obsidian, vault };
 
   try {
-    await run({ directory, stateStore, adapters, environment, vault });
+    await run({ directory, stateStore, adapters, environment, obsidian, vault });
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -56,6 +61,315 @@ test("a plain-language bootstrap completes through the public Setup Session boun
     assert.equal(outcome.savedSetup.validation.vault.exists, true);
     assert.match(outcome.limitation, /simulated Desktop vault/i);
   });
+});
+
+test("an existing official Obsidian installation is detected without modifying existing vaults", async () => {
+  await withSessionFixture(async ({ stateStore, adapters, obsidian }) => {
+    const existingBefore = [
+      { path: "/simulated/Desktop/Work Notes", files: ["Private.md"] },
+      { path: "/simulated/Documents/Journal", files: ["2026-08-17.md"] }
+    ];
+    obsidian.existingVaults = structuredClone(existingBefore);
+
+    const outcome = await startSetupSession(bootstrapInput({ stateStore, adapters }));
+
+    assert.equal(outcome.setupSession.status, "complete");
+    assert.equal(outcome.savedSetup.validation.obsidian.official, true);
+    assert.equal(outcome.savedSetup.validation.obsidian.existingVaultCount, 2);
+    assert.equal(outcome.savedSetup.validation.obsidian.existingVaultsReadOnly, true);
+    assert.deepEqual(obsidian.getExistingVaults(), existingBefore);
+    assert.equal(obsidian.officialInstallActionCalls, 0);
+    assert.equal(obsidian.installCalls, 0);
+    assert.deepEqual(obsidian.openedVaultPaths, ["/simulated/Desktop/My Second Brain"]);
+  });
+});
+
+test("a missing Obsidian app produces one approved official action and waits for detection", async () => {
+  await withSessionFixture(async ({ stateStore, adapters, obsidian }) => {
+    const awaitingApproval = await startSetupSession(bootstrapInput({ stateStore, adapters }));
+
+    assert.equal(awaitingApproval.setupSession.status, "waiting_for_approval");
+    assert.equal(awaitingApproval.setupSession.pendingAction.kind, "approve-official-obsidian-install");
+    assert.equal(awaitingApproval.setupSession.pendingAction.approvalRequired, true);
+    assert.equal(obsidian.officialInstallActionCalls, 0);
+    assert.equal(obsidian.installCalls, 0, "the setup never installs software itself");
+
+    const awaitingCustomer = await continueSetupSession({
+      message: "Continue setting up my second brain",
+      action: { kind: "approve-official-obsidian-install", approved: true },
+      stateStore,
+      adapters
+    });
+
+    assert.equal(awaitingCustomer.setupSession.status, "waiting_for_customer_action");
+    assert.equal(awaitingCustomer.setupSession.pendingAction.customerAction.url, "https://obsidian.md/download");
+    assert.equal(obsidian.officialInstallActionCalls, 1);
+    assert.equal(obsidian.installCalls, 0, "approval creates an official action, not an installation");
+
+    await continueSetupSession({
+      message: "Continue setting up my second brain",
+      stateStore,
+      adapters
+    });
+    assert.equal(obsidian.officialInstallActionCalls, 1, "resume does not duplicate the customer action");
+
+    obsidian.simulateCustomerInstalledOfficialObsidian();
+    const completed = await continueSetupSession({
+      message: "Continue setting up my second brain",
+      stateStore,
+      adapters
+    });
+
+    assert.equal(completed.setupSession.status, "complete");
+    assert.equal(completed.savedSetup.validation.obsidian.openVerified, true);
+    assert.equal(obsidian.installCalls, 0);
+  }, { obsidian: { installed: false, official: false } });
+});
+
+test("the customer vault uses the visible Desktop default or an approved renamed path", async () => {
+  await withSessionFixture(async ({ stateStore, adapters }) => {
+    const defaultVault = await startSetupSession(bootstrapInput({ stateStore, adapters }));
+    assert.equal(defaultVault.vault.desktopPath, "/simulated/Desktop/My Second Brain");
+  });
+
+  await withSessionFixture(async ({ stateStore, adapters }) => {
+    const renamedVault = await startSetupSession(bootstrapInput({
+      stateStore,
+      adapters,
+      decisions: { vaultName: "Rob's Command Center" }
+    }));
+    assert.equal(renamedVault.vault.name, "Rob's Command Center");
+    assert.equal(renamedVault.vault.desktopPath, "/simulated/Desktop/Rob's Command Center");
+  });
+});
+
+test("an existing vault at the requested Desktop path is never changed and can be renamed on resume", async () => {
+  await withSessionFixture(async ({ stateStore, adapters, obsidian, vault }) => {
+    const existingBefore = [{ path: "/simulated/Desktop/My Second Brain", files: ["Do Not Touch.md"] }];
+    obsidian.existingVaults = structuredClone(existingBefore);
+
+    const blocked = await startSetupSession(bootstrapInput({ stateStore, adapters }));
+    assert.equal(blocked.setupSession.status, "blocked");
+    assert.match(blocked.setupSession.message, /existing vault/i);
+    assert.equal(vault.ensureCalls, 0);
+    assert.deepEqual(obsidian.getExistingVaults(), existingBefore);
+
+    const resumed = await continueSetupSession({
+      message: "Continue setting up my second brain",
+      decisions: { vaultName: "My Safe Second Brain" },
+      stateStore,
+      adapters
+    });
+
+    assert.equal(resumed.setupSession.status, "complete");
+    assert.equal(resumed.vault.desktopPath, "/simulated/Desktop/My Safe Second Brain");
+    assert.deepEqual(obsidian.getExistingVaults(), existingBefore);
+    assert.equal(vault.ensureCalls, 1);
+  });
+});
+
+test("a shared macOS profile blocks safely before Obsidian or vault actions", async () => {
+  await withSessionFixture(async ({ stateStore, adapters, obsidian, vault }) => {
+    const blocked = await startSetupSession(bootstrapInput({ stateStore, adapters }));
+
+    assert.equal(blocked.setupSession.status, "blocked");
+    assert.match(blocked.setupSession.message, /shared/i);
+    assert.equal(obsidian.inspectCalls, 0);
+    assert.equal(vault.ensureCalls, 0);
+  }, { environment: { sharedProfile: true } });
+});
+
+test("the injected Obsidian open verifier must pass, then retries through the same Setup Session", async () => {
+  await withSessionFixture(async ({ stateStore, adapters, obsidian, vault }) => {
+    const blocked = await startSetupSession(bootstrapInput({ stateStore, adapters }));
+
+    assert.equal(blocked.setupSession.status, "blocked");
+    assert.equal(blocked.setupSession.stage, "vault");
+    assert.match(blocked.setupSession.message, /opened the new vault/i);
+    assert.equal(vault.ensureCalls, 1);
+    assert.equal(obsidian.openCalls, 1);
+
+    const resumed = await continueSetupSession({
+      message: "Continue setting up my second brain",
+      stateStore,
+      adapters
+    });
+
+    assert.equal(resumed.setupSession.status, "complete");
+    assert.equal(vault.ensureCalls, 1, "retry does not recreate the customer vault");
+    assert.equal(obsidian.openCalls, 2);
+    assert.equal(resumed.savedSetup.validation.obsidian.openedVaultPath, "/simulated/Desktop/My Second Brain");
+  }, { obsidian: { openFailuresBeforeSuccess: 1 } });
+});
+
+test("the guarded macOS adapters use an approved temporary Desktop path and injected exact-open verifier", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "qwave-second-brain-qwa140-macos-adapter-"));
+  const desktopRoot = path.join(directory, "Desktop");
+  const approvedVaultPath = path.join(desktopRoot, "My Second Brain");
+  const appPath = "/Applications/Obsidian.app";
+  const registryPath = "/simulated/obsidian.json";
+  const openedCommands = [];
+  const verificationSleeps = [];
+  let observedOpenPath = null;
+  let openReadbacks = 0;
+  const fakeObsidianFileSystem = {
+    async stat(candidate) {
+      if (candidate === appPath) return { isDirectory: () => true };
+      throw Object.assign(new Error("Not found"), { code: "ENOENT" });
+    },
+    async readFile(candidate) {
+      if (candidate === path.join(appPath, "Contents", "Info.plist")) {
+        return "<plist><dict><key>CFBundleIdentifier</key><string>md.obsidian</string></dict></plist>";
+      }
+      if (candidate === registryPath) {
+        return JSON.stringify({ vaults: { existing: { path: "/simulated/Desktop/Existing", open: false } } });
+      }
+      throw Object.assign(new Error("Not found"), { code: "ENOENT" });
+    }
+  };
+  const vault = new MacOSDesktopVaultAdapter({
+    desktopRoot,
+    approvedVaultPath,
+    allowCreate: true,
+    simulated: true
+  });
+  const obsidian = new MacOSObsidianAdapter({
+    appPath,
+    vaultRegistryPath: registryPath,
+    approvedVaultPath,
+    allowVaultOpen: true,
+    fileSystem: fakeObsidianFileSystem,
+    runOpenCommand: async (command) => {
+      openedCommands.push(command);
+      observedOpenPath = command.vaultPath;
+      return { started: true };
+    },
+    readOpenVaultPath: async () => {
+      openReadbacks += 1;
+      return openReadbacks < 3 ? null : observedOpenPath;
+    },
+    openVerificationAttempts: 3,
+    openVerificationDelayMs: 0,
+    sleep: async (delay) => verificationSleeps.push(delay),
+    simulated: true
+  });
+  const stateStore = new FileStateStore(path.join(directory, "private-state", "setup-session.json"));
+
+  try {
+    await mkdir(desktopRoot, { recursive: true });
+    const outcome = await startSetupSession({
+      ...bootstrapInput(),
+      stateStore,
+      adapters: {
+        environment: new SimulatedEnvironmentAdapter(),
+        obsidian,
+        vault
+      }
+    });
+
+    assert.equal(outcome.setupSession.status, "complete");
+    assert.equal(outcome.vault.desktopPath, approvedVaultPath);
+    assert.equal(outcome.savedSetup.validation.obsidian.openVerified, true);
+    assert.match(outcome.limitation, /simulated Desktop vault and Obsidian adapters/i);
+    assert.deepEqual(openedCommands, [{ appPath, vaultPath: approvedVaultPath }]);
+    assert.deepEqual(verificationSleeps, [0, 0], "open is read back until the registry confirms the exact path");
+    assert.match(await readFile(path.join(approvedVaultPath, "Home.md"), "utf8"), /Current focus/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a guarded macOS vault resumes an injected write failure without touching a pre-existing vault", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "qwave-second-brain-qwa140-vault-retry-"));
+  const desktopRoot = path.join(directory, "Desktop");
+  const approvedVaultPath = path.join(desktopRoot, "My Second Brain");
+  const existingVaultPath = path.join(desktopRoot, "Existing Vault");
+  const appPath = "/Applications/Obsidian.app";
+  const registryPath = "/simulated/obsidian.json";
+  let failTargetHomeOnce = true;
+  const flakyFileSystem = {
+    mkdir,
+    mkdtemp,
+    readFile,
+    rm,
+    stat,
+    writeFile: async (candidate, content, options) => {
+      if (candidate === path.join(approvedVaultPath, "Home.md") && failTargetHomeOnce) {
+        failTargetHomeOnce = false;
+        throw new Error("Injected target Home write failure");
+      }
+      return writeFile(candidate, content, options);
+    }
+  };
+  const fakeObsidianFileSystem = {
+    async stat(candidate) {
+      if (candidate === appPath) return { isDirectory: () => true };
+      throw Object.assign(new Error("Not found"), { code: "ENOENT" });
+    },
+    async readFile(candidate) {
+      if (candidate === path.join(appPath, "Contents", "Info.plist")) {
+        return "<plist><dict><key>CFBundleIdentifier</key><string>md.obsidian</string></dict></plist>";
+      }
+      if (candidate === registryPath) return JSON.stringify({ vaults: {} });
+      throw Object.assign(new Error("Not found"), { code: "ENOENT" });
+    }
+  };
+  const vault = new MacOSDesktopVaultAdapter({
+    desktopRoot,
+    approvedVaultPath,
+    allowCreate: true,
+    fileSystem: flakyFileSystem,
+    simulated: true
+  });
+  const obsidian = new MacOSObsidianAdapter({
+    appPath,
+    vaultRegistryPath: registryPath,
+    approvedVaultPath,
+    allowVaultOpen: true,
+    fileSystem: fakeObsidianFileSystem,
+    runOpenCommand: async () => ({ started: true }),
+    readOpenVaultPath: async () => approvedVaultPath,
+    simulated: true
+  });
+  const stateStore = new FileStateStore(path.join(directory, "private-state", "setup-session.json"));
+
+  try {
+    await mkdir(existingVaultPath, { recursive: true });
+    await writeFile(path.join(existingVaultPath, "Do Not Touch.md"), "customer content\n", "utf8");
+
+    const blocked = await startSetupSession({
+      ...bootstrapInput(),
+      stateStore,
+      adapters: {
+        environment: new SimulatedEnvironmentAdapter(),
+        obsidian,
+        vault
+      }
+    });
+    assert.equal(blocked.setupSession.status, "blocked");
+    assert.equal(blocked.setupSession.stage, "foundation");
+    assert.equal(await readFile(path.join(existingVaultPath, "Do Not Touch.md"), "utf8"), "customer content\n");
+    assert.equal(
+      (await readdir(desktopRoot)).some((name) => name.startsWith("My Second Brain.qwave-second-brain-staging-")),
+      false,
+      "the installer cleans only its verified staging folder after the failed write"
+    );
+
+    const resumed = await continueSetupSession({
+      message: "Continue setting up my second brain",
+      stateStore,
+      adapters: {
+        environment: new SimulatedEnvironmentAdapter(),
+        obsidian,
+        vault
+      }
+    });
+    assert.equal(resumed.setupSession.status, "complete");
+    assert.match(await readFile(path.join(approvedVaultPath, "Home.md"), "utf8"), /Current focus/);
+    assert.equal(await readFile(path.join(existingVaultPath, "Do Not Touch.md"), "utf8"), "customer content\n");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("slash commands are rejected in favor of the ordinary-language entry point", async () => {
@@ -93,7 +407,7 @@ test("a vault name cannot escape the customer Desktop boundary", async () => {
 });
 
 test("every completed stage survives interruption and resumes without a duplicate vault", async () => {
-  for (const stopAfterStage of ["environment", "foundation", "vault", "validation"]) {
+  for (const stopAfterStage of SETUP_STAGES) {
     await withSessionFixture(async ({ directory, adapters, vault }) => {
       const firstStore = new FileStateStore(path.join(directory, "private-state", "setup-session.json"));
       const paused = await startSetupSession({
