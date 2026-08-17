@@ -72,3 +72,20 @@ export {
   SimulatedGoogleDriveConnector,
   SimulatedGoogleDrivePlugin
 } from "./connectors/simulated-google-drive-plugin.mjs";
+
+export {
+  GMAIL_CONNECTION_STATES,
+  GMAIL_IN_APP_FALLBACK_ACTION,
+  GmailReadOnlyConnector,
+  GmailReadOnlyError,
+  beginGmailConnection,
+  beginGmailPrivacyReview,
+  cancelGmailReadOnlyScope,
+  fetchApprovedGmailReferences,
+  getGmailReadOnlyStatus,
+  grantGmailReadOnlyScope,
+  revokeGmailReadOnlyConnection,
+  skipGmailConnection
+} from "./connectors/gmail-readonly.mjs";
+
+export { SimulatedGmailPlugin } from "./connectors/simulated-gmail-plugin.mjs";
