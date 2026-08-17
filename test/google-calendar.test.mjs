@@ -517,3 +517,83 @@ test("external Calendar revocation invalidates an active grant instead of revivi
     assert.equal(connector.writeCalls, 0);
   });
 });
+
+test("a Calendar adapter cannot surface an unreviewed or final-scope-excluded event reference", async () => {
+  await withCalendarFixture(async ({ stateStore, connector }) => {
+    const review = await beginGoogleCalendarReview({
+      message: "Review my Calendar for my second brain",
+      stateStore,
+      connector,
+      clock,
+      reviewIdFactory: () => "bounded-record-review"
+    });
+    const accountId = review.googleCalendar.permissionReview.account.id;
+    const excludedRecord = connector.events.find((candidate) => candidate.area !== connector.events[0].area);
+    assert.ok(excludedRecord, "fixture must contain a second reviewed calendar area");
+
+    const scope = approvedScope(review);
+    scope.exclusions.areas = [excludedRecord.area];
+    await grantGoogleCalendarContent({
+      message: "Approve only the selected Calendar area",
+      stateStore,
+      connector,
+      accountId,
+      reviewId: "bounded-record-review",
+      scope,
+      clock,
+      grantIdFactory: () => "bounded-record-grant"
+    });
+
+    const originalFetch = connector.fetchApprovedContent.bind(connector);
+    connector.fetchApprovedContent = async (input) => ({
+      rawBodiesReturned: false,
+      records: [{ sourceRecordId: excludedRecord.id, source: "google-calendar" }]
+    });
+    await assert.rejects(
+      () => fetchApprovedGoogleCalendarContent({
+        message: "Import the approved Calendar events",
+        stateStore,
+        connector,
+        accountId,
+        reviewId: "bounded-record-review",
+        clock
+      }),
+      (error) => error?.code === "CALENDAR_SCOPE_BYPASS"
+    );
+
+    connector.fetchApprovedContent = async (input) => ({
+      rawBodiesReturned: false,
+      records: [{ sourceRecordId: "calendar-event-00000000000000000000", source: "google-calendar" }]
+    });
+    await assert.rejects(
+      () => fetchApprovedGoogleCalendarContent({
+        message: "Retry the saved approved Calendar scope",
+        stateStore,
+        connector,
+        accountId,
+        reviewId: "bounded-record-review",
+        clock
+      }),
+      (error) => error?.code === "CALENDAR_UNREVIEWED_RECORD"
+    );
+
+    connector.fetchApprovedContent = originalFetch;
+    const recovered = await fetchApprovedGoogleCalendarContent({
+      message: "Import only the final approved Calendar area",
+      stateStore,
+      connector,
+      accountId,
+      reviewId: "bounded-record-review",
+      clock
+    });
+    assert.equal(recovered.approvedRecords.length, 1);
+    assert.equal(recovered.approvedRecords[0].sourceRecordId, connector.events.find((candidate) => candidate.id !== excludedRecord.id).id);
+  }, {
+    connectorOptions: {
+      events: [
+        event({ id: "approved-work-event", calendarId: "work-calendar" }),
+        event({ id: "excluded-private-event", calendarId: "private-calendar" })
+      ]
+    }
+  });
+});

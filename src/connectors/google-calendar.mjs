@@ -9,6 +9,7 @@
 
 import {
   DEFAULT_PERMISSION_WINDOWS,
+  SENSITIVE_CATEGORIES,
   beginSourcePermissionReview,
   fetchApprovedSourceContent,
   getSourcePermissionStatus,
@@ -20,6 +21,12 @@ const SOURCE = "google-calendar";
 const STATE_KEY = "googleCalendarLifecycle";
 const CONNECTION_STATUSES = new Set(["ready", "partial", "empty", "revoked", "unavailable"]);
 const RETRYABLE_ENTRY_STATUSES = new Set(["awaiting-grant", "grant-retry-required", "ready-to-import", "fetch-retry-required", "imported", "imported-partially", "empty", "empty-partial"]);
+const SENSITIVE_CATEGORY_SET = new Set(SENSITIVE_CATEGORIES);
+const CALENDAR_ACCOUNT_ID = /^calendar-account-[a-f0-9]{20}$/;
+const CALENDAR_EVENT_ID = /^calendar-event-[a-f0-9]{20}$/;
+const CALENDAR_AREA_ID = /^calendar-[a-f0-9]{20}$/;
+const CALENDAR_PERSON_ID = /^calendar-person-[a-f0-9]{20}$/;
+const ACCESS_LEVELS = new Set(["allowed", "restricted", "blocked"]);
 
 export class GoogleCalendarLifecycleError extends Error {
   constructor(code, customerMessage) {
@@ -27,6 +34,226 @@ export class GoogleCalendarLifecycleError extends Error {
     this.name = "GoogleCalendarLifecycleError";
     this.code = code;
     this.customerMessage = customerMessage;
+  }
+}
+
+function nonEmptyString(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function uniqueStrings(values) {
+  return [...new Set((Array.isArray(values) ? values : [])
+    .map(nonEmptyString)
+    .filter(Boolean))].sort();
+}
+
+function safeIsoTimestamp(value) {
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null;
+}
+
+function isCalendarAccountId(value) {
+  return CALENDAR_ACCOUNT_ID.test(value ?? "");
+}
+
+function isCalendarEventId(value) {
+  return CALENDAR_EVENT_ID.test(value ?? "");
+}
+
+function isCalendarAreaId(value) {
+  return CALENDAR_AREA_ID.test(value ?? "");
+}
+
+function isCalendarPersonId(value) {
+  return CALENDAR_PERSON_ID.test(value ?? "");
+}
+
+function calendarSensitiveCategories(item) {
+  const supplied = uniqueStrings(item?.sensitiveCategories);
+  const categories = new Set(supplied.filter((category) => SENSITIVE_CATEGORY_SET.has(category)));
+  // An adapter that labels a category we do not recognize must not receive a
+  // silent pass-through. Keep it excluded until a supported contract can
+  // classify it explicitly.
+  if (supplied.some((category) => !SENSITIVE_CATEGORY_SET.has(category))) categories.add("uncertain-sensitivity");
+  if (item?.uncertainSensitivity === true || item?.calendarPrivate === true || item?.calendarSensitive === true || item?.titleSensitive === true) {
+    categories.add("private-restricted-labels");
+  }
+  const title = nonEmptyString(item?.title ?? item?.summary ?? item?.label) ?? "";
+  if (/\b(?:password|passcode|secret|api[ _-]?key|medical|doctor|legal|lawsuit|payroll|salary|hr|bank|social security)\b/i.test(title)) {
+    categories.add("private-restricted-labels");
+  }
+  return [...categories].sort();
+}
+
+function normalizeCalendarMetadata(metadata, expectedAccountId = null) {
+  if (!metadata || typeof metadata !== "object" || metadata.source !== SOURCE || metadata.readOnly !== true) {
+    throw new GoogleCalendarLifecycleError("CALENDAR_METADATA_INVALID", "I could not safely confirm read-only Calendar metadata, so no event detail was read.");
+  }
+  const accountId = nonEmptyString(metadata.account?.id);
+  if (!isCalendarAccountId(accountId) || (expectedAccountId && accountId !== expectedAccountId)) {
+    throw new GoogleCalendarLifecycleError("CALENDAR_ACCOUNT_MISMATCH", "I could not safely match the Calendar metadata to this connection, so no event detail was read.");
+  }
+
+  const accessByPersonId = new Map();
+  for (const person of Array.isArray(metadata.people) ? metadata.people : []) {
+    const personId = nonEmptyString(person?.id);
+    if (!isCalendarPersonId(personId)) {
+      throw new GoogleCalendarLifecycleError("CALENDAR_METADATA_INVALID", "Calendar metadata contained an unsafe attendee reference, so no event detail was read.");
+    }
+    const accessLevel = ACCESS_LEVELS.has(person?.accessLevel) ? person.accessLevel : "restricted";
+    const previous = accessByPersonId.get(personId);
+    if (!previous || ["allowed", "restricted", "blocked"].indexOf(accessLevel) > ["allowed", "restricted", "blocked"].indexOf(previous)) {
+      accessByPersonId.set(personId, accessLevel);
+    }
+  }
+
+  const items = (Array.isArray(metadata.items) ? metadata.items : []).map((item) => {
+    const id = nonEmptyString(item?.id);
+    const area = nonEmptyString(item?.area);
+    const timestamp = safeIsoTimestamp(item?.timestamp);
+    const participantIds = uniqueStrings(item?.participantIds);
+    if (!isCalendarEventId(id) || !isCalendarAreaId(area) || !timestamp || item?.kind !== "item" || item?.category !== "calendar-event" || participantIds.some((personId) => !isCalendarPersonId(personId))) {
+      throw new GoogleCalendarLifecycleError("CALENDAR_METADATA_INVALID", "Calendar metadata did not preserve the approved opaque event boundary, so no event detail was read.");
+    }
+    for (const personId of participantIds) {
+      if (!accessByPersonId.has(personId)) accessByPersonId.set(personId, "restricted");
+    }
+    const sensitiveCategories = calendarSensitiveCategories(item);
+    return {
+      id,
+      kind: "item",
+      area,
+      category: "calendar-event",
+      timestamp,
+      participantIds,
+      sensitiveCategories,
+      label: sensitiveCategories.length > 0 ? "Sensitive calendar event" : "Calendar event"
+    };
+  });
+
+  if (new Set(items.map((item) => item.id)).size !== items.length) {
+    throw new GoogleCalendarLifecycleError("CALENDAR_METADATA_INVALID", "Calendar metadata contained an ambiguous event reference, so no event detail was read.");
+  }
+  const people = [...accessByPersonId.entries()]
+    .filter(([personId]) => items.some((item) => item.participantIds.includes(personId)))
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([id, accessLevel]) => ({
+      id,
+      accessLevel,
+      label: accessLevel === "allowed" ? "Approved attendee" : "Private attendee"
+    }));
+
+  return {
+    source: SOURCE,
+    account: { id: accountId, label: "Calendar account" },
+    readOnly: true,
+    people,
+    areas: uniqueStrings(items.map((item) => item.area)),
+    categories: ["calendar-event"],
+    items
+  };
+}
+
+function reviewedCalendarRecords(metadata, accountId) {
+  const normalized = normalizeCalendarMetadata(metadata, accountId);
+  return Object.fromEntries(normalized.items.map((item) => [item.id, {
+    sourceRecordId: item.id,
+    area: item.area,
+    category: item.category,
+    timestamp: item.timestamp,
+    participantIds: item.participantIds,
+    sensitiveCategories: item.sensitiveCategories
+  }]));
+}
+
+function recordFitsCalendarGrant(record, grant, accountId) {
+  const scope = grant?.scope;
+  if (!scope || grant?.source !== SOURCE || scope.accountId !== accountId || !isCalendarEventId(record?.sourceRecordId)) return false;
+  const timestamp = Date.parse(record.timestamp);
+  const from = Date.parse(scope.dateRange?.from);
+  const to = Date.parse(scope.dateRange?.to);
+  if (!Number.isFinite(timestamp) || !Number.isFinite(from) || !Number.isFinite(to) || timestamp < from || timestamp > to) return false;
+  if ((scope.exclusions?.dateRanges ?? []).some((range) => {
+    const excludedFrom = Date.parse(range?.from);
+    const excludedTo = Date.parse(range?.to);
+    return Number.isFinite(excludedFrom) && Number.isFinite(excludedTo) && timestamp >= excludedFrom && timestamp <= excludedTo;
+  })) return false;
+  if (!Array.isArray(scope.areas) || !scope.areas.includes(record.area)) return false;
+  if (!Array.isArray(scope.categories) || !scope.categories.includes(record.category)) return false;
+  if ((record.participantIds ?? []).some((personId) => (scope.exclusions?.people ?? []).includes(personId))) return false;
+  const excludedSensitive = new Set([
+    ...(scope.sensitiveGroups?.excluded ?? []),
+    ...(scope.exclusions?.categories ?? [])
+  ]);
+  return !(record.sensitiveCategories ?? []).some((category) => excludedSensitive.has(category));
+}
+
+/**
+ * Enforces the exact opaque event inventory shown during metadata review.
+ * An injected adapter cannot surface a new event, a raw identifier, or a
+ * reviewed event that falls outside the final granular grant.
+ */
+export class CalendarBoundedConnector {
+  constructor(connector, { reviewedRecordsById = null } = {}) {
+    assertCalendarConnector(connector);
+    this.connector = connector;
+    this.reviewedRecordsById = reviewedRecordsById === null ? null : new Map(Object.entries(reviewedRecordsById));
+    this.lastMetadata = null;
+  }
+
+  assertGrant(grant) {
+    if (grant?.source !== SOURCE || !isCalendarAccountId(grant?.accountId) || grant?.scope?.accountId !== grant.accountId) {
+      throw new GoogleCalendarLifecycleError("CALENDAR_GRANT_INVALID", "The Calendar grant did not match its read-only account boundary, so no event detail was read.");
+    }
+  }
+
+  async discoverMetadata({ source }) {
+    if (source !== SOURCE) throw new GoogleCalendarLifecycleError("CALENDAR_SOURCE_MISMATCH", "The source did not match the Calendar review, so no event detail was read.");
+    this.lastMetadata = normalizeCalendarMetadata(await this.connector.discoverMetadata({ source }));
+    return clone(this.lastMetadata);
+  }
+
+  async registerPermissionGrant({ grant }) {
+    this.assertGrant(grant);
+    return this.connector.registerPermissionGrant({ grant });
+  }
+
+  async revokePermissionGrant({ grantId }) {
+    return this.connector.revokePermissionGrant({ grantId });
+  }
+
+  async fetchApprovedContent({ source, accountId, grant }) {
+    if (source !== SOURCE || !isCalendarAccountId(accountId)) {
+      throw new GoogleCalendarLifecycleError("CALENDAR_SOURCE_MISMATCH", "The source did not match the Calendar review, so no event detail was read.");
+    }
+    this.assertGrant(grant);
+    if (grant.accountId !== accountId || !this.reviewedRecordsById) {
+      throw new GoogleCalendarLifecycleError("CALENDAR_REVIEWED_RECORDS_MISSING", "The saved Calendar review no longer has a safe event inventory, so no event detail was read. Start a new review.");
+    }
+    const result = await this.connector.fetchApprovedContent({ source, accountId, grant });
+    if (result?.rawBodiesReturned === true || !Array.isArray(result?.records)) {
+      throw new GoogleCalendarLifecycleError("CALENDAR_BODY_BOUNDARY_INVALID", "The Calendar connector did not preserve the source-body boundary, so no event detail was exposed.");
+    }
+    const seen = new Set();
+    const records = result.records.map((record) => {
+      const sourceRecordId = nonEmptyString(record?.sourceRecordId ?? record?.id);
+      if (!isCalendarEventId(sourceRecordId) || (record?.source && record.source !== SOURCE)) {
+        throw new GoogleCalendarLifecycleError("CALENDAR_RECORD_INVALID", "The Calendar connector returned an invalid approved reference, so no event detail was exposed.");
+      }
+      if (seen.has(sourceRecordId)) {
+        throw new GoogleCalendarLifecycleError("CALENDAR_RECORD_DUPLICATE", "The Calendar connector returned a duplicate approved reference, so no event detail was exposed.");
+      }
+      seen.add(sourceRecordId);
+      const reviewed = this.reviewedRecordsById.get(sourceRecordId);
+      if (!reviewed) {
+        throw new GoogleCalendarLifecycleError("CALENDAR_UNREVIEWED_RECORD", "The Calendar connector returned an event outside the reviewed scope, so no event detail was exposed.");
+      }
+      if (!recordFitsCalendarGrant(reviewed, grant, accountId)) {
+        throw new GoogleCalendarLifecycleError("CALENDAR_SCOPE_BYPASS", "The Calendar connector returned an event outside the final granted scope, so no event detail was exposed.");
+      }
+      return { sourceRecordId, source: SOURCE };
+    });
+    return { rawBodiesReturned: false, records };
   }
 }
 
@@ -130,7 +357,7 @@ function numberOrZero(value) {
 }
 
 function normalizeAvailability(value) {
-  if (!value || value.readOnly !== true || typeof value.accountId !== "string" || !value.accountId.trim()) {
+  if (!value || value.readOnly !== true || !isCalendarAccountId(value.accountId)) {
     throw new GoogleCalendarLifecycleError("CALENDAR_STATUS_INVALID", "I could not safely confirm a read-only Calendar connection, so I stopped before reading event details.");
   }
   if (!CONNECTION_STATUSES.has(value.status)) {
@@ -138,7 +365,7 @@ function normalizeAvailability(value) {
   }
   return {
     status: value.status,
-    accountId: value.accountId.trim(),
+    accountId: value.accountId,
     readOnly: true,
     availableCalendarCount: numberOrZero(value.availableCalendarCount),
     unavailableCalendarCount: numberOrZero(value.unavailableCalendarCount),
@@ -162,6 +389,7 @@ function newEntry(accountId, availability, now) {
     accountId,
     status: "metadata-retry-required",
     reviewId: null,
+    reviewedRecordsById: {},
     availability: clone(availability),
     audit: [{ type: "calendar-lifecycle-started", at: now, contentDetailsRead: false }]
   };
@@ -244,6 +472,15 @@ function canRetryFetch(error) {
   // Privacy-boundary failures (for example a tampered persisted grant or an
   // adapter returning raw bodies) must surface as hard failures. Only adapter
   // availability failures and a safe grant-registration restore are resumable.
+  if ([
+    "CALENDAR_BODY_BOUNDARY_INVALID",
+    "CALENDAR_GRANT_INVALID",
+    "CALENDAR_RECORD_DUPLICATE",
+    "CALENDAR_RECORD_INVALID",
+    "CALENDAR_REVIEWED_RECORDS_MISSING",
+    "CALENDAR_SCOPE_BYPASS",
+    "CALENDAR_UNREVIEWED_RECORD"
+  ].includes(error?.code)) return false;
   return !error?.code || error.code === "PERMISSION_GRANT_RESTORE_FAILED" || /^CALENDAR_/.test(error.code);
 }
 
@@ -354,11 +591,13 @@ export async function beginGoogleCalendarReview({ message, stateStore, connector
   }
 
   let review;
+  let bounded;
   try {
+    bounded = new CalendarBoundedConnector(connector);
     review = await beginSourcePermissionReview({
       message,
       stateStore,
-      connector,
+      connector: bounded,
       source: SOURCE,
       language: languageFor(state, language),
       clock,
@@ -381,6 +620,7 @@ export async function beginGoogleCalendarReview({ message, stateStore, connector
   const reviewedEntry = ensureEntry(state, availability.accountId, availability, now);
   reviewedEntry.status = statusForPermission(review.permissionReview);
   reviewedEntry.reviewId = review.permissionReview.permissionRequest.reviewId;
+  reviewedEntry.reviewedRecordsById = reviewedCalendarRecords(bounded.lastMetadata, availability.accountId);
   recordAudit(state, reviewedEntry, {
     type: "calendar-metadata-reviewed",
     at: now,
@@ -422,7 +662,18 @@ export async function grantGoogleCalendarContent({ message, stateStore, connecto
 
   let granted;
   try {
-    granted = await grantSourcePermission({ message, stateStore, connector, source: SOURCE, accountId, reviewId, scope, language, clock, grantIdFactory });
+    granted = await grantSourcePermission({
+      message,
+      stateStore,
+      connector: new CalendarBoundedConnector(connector, { reviewedRecordsById: entry.reviewedRecordsById }),
+      source: SOURCE,
+      accountId,
+      reviewId,
+      scope,
+      language,
+      clock,
+      grantIdFactory
+    });
   } catch (error) {
     if (error?.code !== "PERMISSION_GRANT_ACTIVATION_FAILED") throw error;
     state = await loadState(stateStore);
@@ -473,7 +724,16 @@ export async function fetchApprovedGoogleCalendarContent({ message, stateStore, 
 
   let fetched;
   try {
-    fetched = await fetchApprovedSourceContent({ message, stateStore, connector, source: SOURCE, accountId, reviewId, language, clock });
+    fetched = await fetchApprovedSourceContent({
+      message,
+      stateStore,
+      connector: new CalendarBoundedConnector(connector, { reviewedRecordsById: entry.reviewedRecordsById }),
+      source: SOURCE,
+      accountId,
+      reviewId,
+      language,
+      clock
+    });
   } catch (error) {
     if (!canRetryFetch(error)) throw error;
     state = await loadState(stateStore);

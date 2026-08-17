@@ -29,6 +29,8 @@ Before an event can be eligible for a detail fetch, the simulated adapter applie
 
 Sensitive event metadata is represented with fixed, non-source labels and opaque identifiers. Restricted attendees, blocked attendees, sensitive calendars, and sensitive titles remain excluded by default. The public result contains only opaque inert references—never titles, descriptions, locations, conferencing links, attendees, or raw event bodies.
 
+The lifecycle also retains the exact opaque event inventory shown during metadata review. A connector cannot surface a new event, duplicate a reference, leak a raw identifier, or return a reviewed event that falls outside the final area, date, attendee, or sensitivity grant. Those boundary violations fail closed before any reference reaches the conversation.
+
 The public response also states that Calendar is read-only and cannot create, edit, accept, decline, or delete events. The simulated adapter intentionally has no event mutation API and its mutation counter remains zero in every acceptance case.
 
 ## Predictable event handling and truthful states
@@ -58,16 +60,16 @@ Focused test result after the final review:
 
 ```text
 # QWA-143 focused suite
-1..6
-# pass 6
+1..7
+# pass 7
 # fail 0
 ```
 
 Full private-suite result from the same clean worktree:
 
 ```text
-1..45
-# pass 45
+1..46
+# pass 46
 # fail 0
 ```
 
@@ -78,7 +80,8 @@ The focused suite covers:
 3. recurring-instance normalization and canceled-event exclusion;
 4. empty, partial, and revoked states;
 5. metadata/detail interruption and resume; and
-6. external revocation invalidating a prior active grant before a fresh review.
+6. external revocation invalidating a prior active grant before a fresh review; and
+7. rejection of both an unreviewed event and a reviewed event outside the final granular grant.
 
 ## Honest limitation
 
