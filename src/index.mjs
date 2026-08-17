@@ -39,3 +39,20 @@ export {
 } from "./permissions/setup-source-permissions.mjs";
 
 export { SimulatedReadOnlyConnector } from "./permissions/simulated-connector.mjs";
+
+export {
+  IMessageBetaError,
+  approveIMessageSensitiveContent,
+  attemptIMessageLocalAccess,
+  beginIMessageBeta,
+  beginIMessageSnapshotImport,
+  fetchApprovedIMessageContent,
+  getIMessageBetaStatus,
+  grantIMessageContent,
+  revokeIMessageContent
+} from "./connectors/imessage-beta.mjs";
+
+export {
+  SimulatedIMessageLocalAdapter,
+  SimulatedIMessageSnapshotConnector
+} from "./connectors/simulated-imessage-adapter.mjs";
