@@ -12,6 +12,7 @@
     "test:qwa-138": "node --test test/setup-session.test.mjs",
     "test:qwa-139": "node --test test/source-permissions.test.mjs",
     "test:qwa-141": "node --test test/onboarding.test.mjs",
-    "test:qwa-150": "node --test test/imessage-beta.test.mjs"
+    "test:qwa-150": "node --test test/imessage-beta.test.mjs",
+    "test:qwa-142": "node --test test/google-drive.test.mjs"
   }
 }

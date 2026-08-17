@@ -56,3 +56,19 @@ export {
   SimulatedIMessageLocalAdapter,
   SimulatedIMessageSnapshotConnector
 } from "./connectors/simulated-imessage-adapter.mjs";
+
+export {
+  FolderBoundedDriveConnector,
+  GoogleDriveLifecycleError,
+  authorizeGoogleDriveReadOnly,
+  beginGoogleDriveConnection,
+  fetchApprovedGoogleDriveContent,
+  getGoogleDriveConnectionStatus,
+  grantGoogleDriveFolderContent,
+  revokeGoogleDriveConnection
+} from "./connectors/google-drive.mjs";
+
+export {
+  SimulatedGoogleDriveConnector,
+  SimulatedGoogleDrivePlugin
+} from "./connectors/simulated-google-drive-plugin.mjs";
