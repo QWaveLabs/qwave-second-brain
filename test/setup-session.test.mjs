@@ -212,6 +212,7 @@ test("the guarded macOS adapters use an approved temporary Desktop path and inje
   const verificationSleeps = [];
   let observedOpenPath = null;
   let openReadbacks = 0;
+  let registryReadbacks = 0;
   const fakeObsidianFileSystem = {
     async stat(candidate) {
       if (candidate === appPath) return { isDirectory: () => true };
@@ -222,7 +223,13 @@ test("the guarded macOS adapters use an approved temporary Desktop path and inje
         return "<plist><dict><key>CFBundleIdentifier</key><string>md.obsidian</string></dict></plist>";
       }
       if (candidate === registryPath) {
-        return JSON.stringify({ vaults: { existing: { path: "/simulated/Desktop/Existing", open: false } } });
+        registryReadbacks += 1;
+        return JSON.stringify({
+          vaults: {
+            existing: { path: "/simulated/Desktop/Existing", open: false },
+            ...(registryReadbacks > 1 ? { generated: { path: approvedVaultPath, open: true } } : {})
+          }
+        });
       }
       throw Object.assign(new Error("Not found"), { code: "ENOENT" });
     }
@@ -271,12 +278,140 @@ test("the guarded macOS adapters use an approved temporary Desktop path and inje
     assert.equal(outcome.vault.desktopPath, approvedVaultPath);
     assert.equal(outcome.savedSetup.validation.obsidian.openVerified, true);
     assert.match(outcome.limitation, /simulated Desktop vault and Obsidian adapters/i);
-    assert.deepEqual(openedCommands, [{ appPath, vaultPath: approvedVaultPath }]);
-    assert.deepEqual(verificationSleeps, [0, 0], "open is read back until the registry confirms the exact path");
+    assert.deepEqual(openedCommands, [{ appPath, vaultPath: approvedVaultPath, vaultId: "generated" }]);
+    assert.deepEqual(verificationSleeps, [0, 0], "open is read back until the active-window probe confirms the exact path");
     assert.match(await readFile(path.join(approvedVaultPath, "Home.md"), "utf8"), /Current focus/);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("a generated vault waits for the one official Obsidian registration action and resumes without rebuilding it", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "qwave-second-brain-qwa140-registration-"));
+  const desktopRoot = path.join(directory, "Desktop");
+  const approvedVaultPath = path.join(desktopRoot, "My Second Brain");
+  const appPath = "/Applications/Obsidian.app";
+  const registryPath = "/simulated/obsidian-registration.json";
+  let registered = false;
+  let uriCommands = 0;
+  const fakeObsidianFileSystem = {
+    async stat(candidate) {
+      if (candidate === appPath) return { isDirectory: () => true };
+      throw Object.assign(new Error("Not found"), { code: "ENOENT" });
+    },
+    async readFile(candidate) {
+      if (candidate === path.join(appPath, "Contents", "Info.plist")) {
+        return "<plist><dict><key>CFBundleIdentifier</key><string>md.obsidian</string></dict></plist>";
+      }
+      if (candidate === registryPath) {
+        return JSON.stringify({
+          vaults: registered
+            ? { generated: { path: approvedVaultPath, open: true } }
+            : {}
+        });
+      }
+      throw Object.assign(new Error("Not found"), { code: "ENOENT" });
+    }
+  };
+  const vault = new MacOSDesktopVaultAdapter({
+    desktopRoot,
+    approvedVaultPath,
+    allowCreate: true,
+    simulated: true
+  });
+  const obsidian = new MacOSObsidianAdapter({
+    appPath,
+    vaultRegistryPath: registryPath,
+    approvedVaultPath,
+    allowVaultOpen: true,
+    fileSystem: fakeObsidianFileSystem,
+    runOpenCommand: async ({ vaultId }) => {
+      assert.equal(vaultId, "generated");
+      uriCommands += 1;
+      return { started: true };
+    },
+    readOpenVaultPath: async () => registered ? approvedVaultPath : null,
+    simulated: true
+  });
+  const stateStore = new FileStateStore(path.join(directory, "private-state", "setup-session.json"));
+
+  try {
+    await mkdir(desktopRoot, { recursive: true });
+    const paused = await startSetupSession({
+      ...bootstrapInput(),
+      stateStore,
+      adapters: { environment: new SimulatedEnvironmentAdapter(), obsidian, vault }
+    });
+
+    assert.equal(paused.setupSession.status, "waiting_for_customer_action");
+    assert.equal(paused.setupSession.stage, "vault");
+    assert.equal(paused.setupSession.pendingAction.kind, "open-generated-vault-in-obsidian");
+    assert.equal(paused.setupSession.pendingAction.customerAction.desktopPath, approvedVaultPath);
+    assert.equal(uriCommands, 0, "the vault is not treated as registered before the customer uses Obsidian's official picker");
+    assert.match(await readFile(path.join(approvedVaultPath, "Home.md"), "utf8"), /Current focus/);
+
+    registered = true;
+    const completed = await continueSetupSession({
+      message: "Continue setting up my second brain",
+      stateStore,
+      adapters: { environment: new SimulatedEnvironmentAdapter(), obsidian, vault }
+    });
+
+    assert.equal(completed.setupSession.status, "complete");
+    assert.equal(uriCommands, 1);
+    assert.equal(completed.savedSetup.validation.obsidian.openedVaultPath, approvedVaultPath);
+    assert.equal((await readdir(desktopRoot)).filter((name) => name === "My Second Brain").length, 1);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("multiple registry open flags never substitute for a trusted active-window probe", async () => {
+  const appPath = "/Applications/Obsidian.app";
+  const registryPath = "/simulated/ambiguous-obsidian.json";
+  const approvedVaultPath = "/simulated/Desktop/My Second Brain";
+  let openCommands = 0;
+  const fakeObsidianFileSystem = {
+    async stat(candidate) {
+      if (candidate === appPath) return { isDirectory: () => true };
+      throw Object.assign(new Error("Not found"), { code: "ENOENT" });
+    },
+    async readFile(candidate) {
+      if (candidate === path.join(appPath, "Contents", "Info.plist")) {
+        return "<plist><dict><key>CFBundleIdentifier</key><string>md.obsidian</string></dict></plist>";
+      }
+      if (candidate === registryPath) {
+        return JSON.stringify({
+          vaults: {
+            existing: { path: "/simulated/Desktop/Existing", open: true },
+            generated: { path: approvedVaultPath, open: true }
+          }
+        });
+      }
+      throw Object.assign(new Error("Not found"), { code: "ENOENT" });
+    }
+  };
+  const obsidian = new MacOSObsidianAdapter({
+    appPath,
+    vaultRegistryPath: registryPath,
+    approvedVaultPath,
+    allowVaultOpen: true,
+    fileSystem: fakeObsidianFileSystem,
+    runOpenCommand: async () => {
+      openCommands += 1;
+      return { started: true };
+    },
+    simulated: true
+  });
+
+  const result = await obsidian.verifyVaultOpen({ path: approvedVaultPath });
+  assert.deepEqual(result, {
+    opened: false,
+    path: null,
+    code: "ACTIVE_VAULT_READBACK_REQUIRED",
+    simulated: true
+  });
+  assert.equal(openCommands, 0, "a URI launch is not attempted when the active-window evidence cannot be read safely");
 });
 
 test("a guarded macOS vault resumes an injected write failure without touching a pre-existing vault", async () => {
@@ -287,6 +422,7 @@ test("a guarded macOS vault resumes an injected write failure without touching a
   const appPath = "/Applications/Obsidian.app";
   const registryPath = "/simulated/obsidian.json";
   let failTargetHomeOnce = true;
+  let registryReadbacks = 0;
   const flakyFileSystem = {
     mkdir,
     mkdtemp,
@@ -310,7 +446,14 @@ test("a guarded macOS vault resumes an injected write failure without touching a
       if (candidate === path.join(appPath, "Contents", "Info.plist")) {
         return "<plist><dict><key>CFBundleIdentifier</key><string>md.obsidian</string></dict></plist>";
       }
-      if (candidate === registryPath) return JSON.stringify({ vaults: {} });
+      if (candidate === registryPath) {
+        registryReadbacks += 1;
+        return JSON.stringify({
+          vaults: registryReadbacks > 1
+            ? { generated: { path: approvedVaultPath, open: true } }
+            : {}
+        });
+      }
       throw Object.assign(new Error("Not found"), { code: "ENOENT" });
     }
   };

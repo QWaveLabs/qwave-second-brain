@@ -503,6 +503,32 @@ async function runValidationStage(state, adapters, clock) {
   }
 
   const opened = await adapters.obsidian.verifyVaultOpen({ path: state.vault.desktopPath });
+  if (opened?.code === "VAULT_REGISTRATION_REQUIRED") {
+    const isEs = state.safeDecisions.language === "es";
+    throw new CustomerActionRequired({
+      status: "waiting_for_customer_action",
+      pendingAction: {
+        kind: "open-generated-vault-in-obsidian",
+        status: "waiting_for_customer_action",
+        approvalRequired: false,
+        customerAction: {
+          kind: "open-folder-as-vault",
+          app: "Obsidian",
+          vaultName: state.vault.name,
+          desktopPath: state.vault.desktopPath
+        },
+        message: isEs
+          ? `Tu bóveda ${state.vault.name} ya está en el Escritorio. En Obsidian, elige “Open folder as vault” y selecciona esa carpeta. Después di “Continúa configurando mi segundo cerebro”.`
+          : `Your ${state.vault.name} vault is already on the Desktop. In Obsidian, choose “Open folder as vault” and select that folder. Then say “Continue setting up my second brain.”`
+      }
+    });
+  }
+  if (opened?.code === "ACTIVE_VAULT_READBACK_REQUIRED") {
+    throw new CustomerVisibleError(
+      "ACTIVE_VAULT_READBACK_REQUIRED",
+      "I created the new vault, but this setup does not have a safe way to confirm which Obsidian window is active. Your progress is saved, and I stopped before claiming the new vault was opened."
+    );
+  }
   if (!opened?.opened || opened.path !== state.vault.desktopPath) {
     throw new CustomerVisibleError(
       "OBSIDIAN_OPEN_VERIFICATION_FAILED",

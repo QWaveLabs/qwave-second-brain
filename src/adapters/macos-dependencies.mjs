@@ -44,18 +44,24 @@ function parseBundleIdentifier(infoPlist) {
 function parseVaultRegistry(serializedRegistry) {
   try {
     const registry = JSON.parse(serializedRegistry);
-    return Object.values(registry?.vaults ?? {})
-      .filter((vault) => typeof vault?.path === "string")
-      .map((vault) => ({ path: vault.path, open: vault.open === true }));
+    return Object.entries(registry?.vaults ?? {})
+      .filter(([, vault]) => typeof vault?.path === "string")
+      .map(([id, vault]) => ({ id, path: vault.path, open: vault.open === true }));
   } catch {
     // A corrupt or unavailable registry must never become a reason to alter it.
     return [];
   }
 }
 
-async function defaultRunOpenCommand({ appPath, vaultPath }) {
+async function defaultRunOpenCommand({ vaultId }) {
+  if (typeof vaultId !== "string" || vaultId.length === 0) {
+    return { started: false, errorCode: "VAULT_REGISTRATION_REQUIRED" };
+  }
   try {
-    await execFileAsync("open", ["-a", appPath, vaultPath]);
+    // The official Obsidian URI targets one registered vault. `open -a
+    // Obsidian <folder>` only restores the last vault when Obsidian is already
+    // running, so it is not evidence that the generated vault is active.
+    await execFileAsync("open", [`obsidian://open?vault=${encodeURIComponent(vaultId)}`]);
     return { started: true };
   } catch (error) {
     return { started: false, errorCode: error?.code ?? "OPEN_COMMAND_FAILED" };
@@ -118,10 +124,9 @@ export class MacOSObsidianAdapter {
   }
 
   async #readCurrentlyOpenVaultPath() {
-    if (this.readOpenVaultPath) {
-      return this.readOpenVaultPath();
-    }
-    return (await this.#readVaults()).find((vault) => vault.open)?.path ?? null;
+    if (!this.readOpenVaultPath) return null;
+    const candidate = await this.readOpenVaultPath();
+    return typeof candidate === "string" && candidate.trim() ? resolve(candidate) : null;
   }
 
   async inspect() {
@@ -175,7 +180,23 @@ export class MacOSObsidianAdapter {
       return { opened: false, path: null, code: "OFFICIAL_OBSIDIAN_NOT_READY", simulated: this.simulated };
     }
 
-    const openResult = await this.runOpenCommand({ appPath: this.appPath, vaultPath: requestedPath });
+    const registeredVault = app.existingVaults.find((vault) => resolve(vault.path) === requestedPath);
+    if (!registeredVault?.id) {
+      return { opened: false, path: null, code: "VAULT_REGISTRATION_REQUIRED", simulated: this.simulated };
+    }
+
+    // The registry is discovery-only. Obsidian can retain more than one
+    // `open: true` record, so membership (or registry order) is never treated
+    // as proof that the focused window is the generated vault.
+    if (!this.readOpenVaultPath) {
+      return { opened: false, path: null, code: "ACTIVE_VAULT_READBACK_REQUIRED", simulated: this.simulated };
+    }
+
+    const openResult = await this.runOpenCommand({
+      appPath: this.appPath,
+      vaultPath: requestedPath,
+      vaultId: registeredVault.id
+    });
     if (!openResult?.started) {
       return { opened: false, path: null, code: openResult?.errorCode ?? "OPEN_COMMAND_FAILED", simulated: this.simulated };
     }
