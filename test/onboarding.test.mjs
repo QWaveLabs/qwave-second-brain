@@ -10,6 +10,7 @@ import {
   ONBOARDING_BATCHES,
   SimulatedDesktopVaultAdapter,
   SimulatedEnvironmentAdapter,
+  SimulatedObsidianAdapter,
   continueOnboardingSession,
   continueSetupSession,
   getOnboardingSessionStatus,
@@ -22,11 +23,12 @@ async function withSessionFixture(run, options = {}) {
   const statePath = path.join(directory, "private-state", "setup-session.json");
   const stateStore = new FileStateStore(statePath);
   const environment = new SimulatedEnvironmentAdapter(options.environment);
+  const obsidian = new SimulatedObsidianAdapter(options.obsidian);
   const vault = new SimulatedDesktopVaultAdapter(options.vault);
-  const adapters = { environment, vault };
+  const adapters = { environment, obsidian, vault };
 
   try {
-    await run({ directory, statePath, stateStore, adapters, environment, vault });
+    await run({ directory, statePath, stateStore, adapters, environment, obsidian, vault });
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
