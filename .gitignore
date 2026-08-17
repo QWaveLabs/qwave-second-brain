@@ -1,0 +1,13 @@
+# Customer-owned state and knowledge must never enter the public installer repository.
+.qwave-second-brain/
+customer-state/
+customer-vaults/
+staging/
+*.local.json
+.env
+.env.*
+!.env.example
+
+# Tooling output
+coverage/
+node_modules/

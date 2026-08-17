@@ -1,0 +1,14 @@
+{
+  "name": "qwave-second-brain",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local-first guided setup system for QWave Second Brain.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test",
+    "test:qwa-138": "node --test test/setup-session.test.mjs"
+  }
+}
