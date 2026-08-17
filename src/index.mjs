@@ -89,3 +89,18 @@ export {
 } from "./connectors/gmail-readonly.mjs";
 
 export { SimulatedGmailPlugin } from "./connectors/simulated-gmail-plugin.mjs";
+
+export {
+  CalendarBoundedConnector,
+  GoogleCalendarLifecycleError,
+  beginGoogleCalendarReview,
+  fetchApprovedGoogleCalendarContent,
+  getGoogleCalendarStatus,
+  grantGoogleCalendarContent,
+  revokeGoogleCalendarContent
+} from "./connectors/google-calendar.mjs";
+
+export {
+  SimulatedGoogleCalendarAdapter,
+  SimulatedGoogleCalendarAdapterError
+} from "./connectors/simulated-google-calendar-adapter.mjs";
