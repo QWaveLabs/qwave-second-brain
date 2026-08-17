@@ -8,6 +8,7 @@ import {
   FileStateStore,
   SimulatedDesktopVaultAdapter,
   SimulatedEnvironmentAdapter,
+  SimulatedObsidianAdapter,
   SimulatedReadOnlyConnector,
   DEFAULT_PERMISSION_WINDOWS,
   SENSITIVE_CATEGORIES,
@@ -25,6 +26,7 @@ async function withPermissionFixture(run, { connectorOptions, language = "en" } 
   const stateStore = new FileStateStore(path.join(directory, "private-state", "setup-session.json"));
   const adapters = {
     environment: new SimulatedEnvironmentAdapter(),
+    obsidian: new SimulatedObsidianAdapter(),
     vault: new SimulatedDesktopVaultAdapter()
   };
   const connector = new SimulatedReadOnlyConnector(connectorOptions ?? {
