@@ -56,3 +56,17 @@ export {
   SimulatedIMessageLocalAdapter,
   SimulatedIMessageSnapshotConnector
 } from "./connectors/simulated-imessage-adapter.mjs";
+
+export {
+  GoogleCalendarLifecycleError,
+  beginGoogleCalendarReview,
+  fetchApprovedGoogleCalendarContent,
+  getGoogleCalendarStatus,
+  grantGoogleCalendarContent,
+  revokeGoogleCalendarContent
+} from "./connectors/google-calendar.mjs";
+
+export {
+  SimulatedGoogleCalendarAdapter,
+  SimulatedGoogleCalendarAdapterError
+} from "./connectors/simulated-google-calendar-adapter.mjs";
