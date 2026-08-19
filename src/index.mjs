@@ -58,6 +58,24 @@ export {
 } from "./connectors/simulated-imessage-adapter.mjs";
 
 export {
+  SlackLifecycleError,
+  approveSlackBlockedGroupException,
+  authorizeSlackOfficialPlugin,
+  beginSlackConnection,
+  denySlackContentReview,
+  fetchApprovedSlackContent,
+  getSlackConnectionStatus,
+  grantSlackContent,
+  requestSlackBlockedGroupException,
+  revokeSlackContent
+} from "./connectors/slack.mjs";
+
+export {
+  SimulatedSlackOfficialPlugin,
+  SlackPluginError
+} from "./connectors/simulated-slack-plugin.mjs";
+
+export {
   FolderBoundedDriveConnector,
   GoogleDriveLifecycleError,
   authorizeGoogleDriveReadOnly,
@@ -72,6 +90,17 @@ export {
   SimulatedGoogleDriveConnector,
   SimulatedGoogleDrivePlugin
 } from "./connectors/simulated-google-drive-plugin.mjs";
+
+export {
+  CANONICAL_SUBJECT_TYPES,
+  DetachedLocalRetentionService,
+  KnowledgeCompilationError,
+  LocalTemporaryStaging,
+  TEMPORARY_STAGING_POLICY,
+  cleanupExpiredKnowledgeStaging,
+  compileApprovedRecords,
+  getKnowledgeCompilationStatus
+} from "./knowledge/approved-record-compiler.mjs";
 
 export {
   GMAIL_CONNECTION_STATES,
@@ -104,3 +133,60 @@ export {
   SimulatedGoogleCalendarAdapter,
   SimulatedGoogleCalendarAdapterError
 } from "./connectors/simulated-google-calendar-adapter.mjs";
+
+export {
+  LIVE_CONNECTOR_RELEASE_GATE,
+  SOURCE_ADAPTER_NAMES,
+  SOURCE_HANDOFF_CATEGORIES,
+  SOURCE_STATE_VOCABULARY,
+  SOURCE_STATUS_STATES,
+  SourceStatusError,
+  beginSimulatedExportPreview,
+  buildSimulatedExportPermissionScope,
+  explainUnsupportedSource,
+  getPersistedAdapterSourceStatus,
+  getSourceStatus,
+  getSourceStatusHandoff,
+  grantSimulatedExportPermission,
+  importSimulatedExportSnapshot,
+  normalizeAdapterSourceStatus,
+  recoverInterruptedSimulatedExportImport,
+  resumeOptionalSource,
+  revokeSimulatedExportPermission,
+  skipOptionalSource
+} from "./source-status.mjs";
+
+export { SimulatedGenericExportAdapter } from "./connectors/simulated-generic-export.mjs";
+
+export {
+  OFFICIAL_WHATSAPP_BUSINESS_VERIFICATION_PROTOCOL,
+  WHATSAPP_LOCAL_SNAPSHOT_CONTRACT,
+  WhatsAppSnapshotError,
+  beginWhatsAppPersonalSnapshot,
+  beginWhatsAppSnapshotImport,
+  cancelWhatsAppSnapshotReview,
+  cleanupWhatsAppSnapshotPrivateMemory,
+  confirmWhatsAppPersonalExport,
+  denyWhatsAppSnapshotContent,
+  fetchApprovedWhatsAppSnapshotContent,
+  getWhatsAppOfficialBusinessStatus,
+  getWhatsAppSnapshotStatus,
+  grantWhatsAppSnapshotContent,
+  restartWhatsAppSnapshotReview,
+  resumeWhatsAppSnapshotFetch,
+  revokeWhatsAppSnapshotContent,
+  selectWhatsAppSnapshotMedia,
+  selectWhatsAppSnapshotScope,
+  verifyWhatsAppOfficialBusinessConnection
+} from "./connectors/whatsapp-snapshot.mjs";
+
+export { SimulatedWhatsAppSnapshotConnector } from "./connectors/simulated-whatsapp-snapshot-adapter.mjs";
+
+export {
+  DEFAULT_WHATSAPP_SNAPSHOT_ACCOUNT_REF,
+  DEFAULT_WHATSAPP_SNAPSHOT_LIMITS,
+  LocalWhatsAppSnapshotConnector,
+  LocalWhatsAppSnapshotError,
+  WHATSAPP_SNAPSHOT_BUNDLE_FORMAT,
+  WHATSAPP_SNAPSHOT_CONNECTOR_PROTOCOL
+} from "./connectors/local-whatsapp-snapshot-connector.mjs";

@@ -12,12 +12,28 @@ import {
   beginSourcePermissionReview,
   fetchApprovedSourceContent,
   getSourcePermissionStatus,
+  getSourcePermissionStatusFromState,
   grantSourcePermission,
   revokeSourcePermission
 } from "../permissions/setup-source-permissions.mjs";
 
+import {
+  getRawIdentifierForAlias,
+  internalPermissionScopeFromStableAliases,
+  isStableLocalAlias,
+  migrateStableLocalAliases,
+  projectApprovedReferencesWithStableAliases,
+  projectAuditWithStableAliases,
+  projectPermissionReviewWithStableAliases,
+  stableAccountAlias,
+  validStableLocalAliasLifecycleEntries
+} from "./stable-local-aliases.mjs";
+import { getPersistedAdapterSourceStatus, SOURCE_ADAPTER_NAMES } from "../source-status.mjs";
+
 const STATE_KEY = "imessageBetaLifecycle";
 const SOURCE = "imessage";
+const ALIAS_NAMESPACE = "imessage";
+const DEFAULT_ACCOUNT_ID = "local-imessage";
 const LOCAL_STATUSES = new Set(["granted", "denied", "unavailable"]);
 
 export class IMessageBetaError extends Error {
@@ -128,11 +144,92 @@ function assertEntry(state, accountId) {
   return entry;
 }
 
+function localAccountReferenceRequired() {
+  throw new IMessageBetaError(
+    "IMESSAGE_LOCAL_ACCOUNT_REFERENCE_REQUIRED",
+    "Use the saved local iMessage account reference from this setup session."
+  );
+}
+
+function resolveIMessageLifecycleAccount(state, requestedAccountId) {
+  const entries = lifecycle(state).entries;
+  const validEntries = validStableLocalAliasLifecycleEntries(Object.values(entries), ALIAS_NAMESPACE);
+
+  if (requestedAccountId === undefined) {
+    const defaultEntry = entries[entryKey(DEFAULT_ACCOUNT_ID)];
+    if (!defaultEntry) {
+      return {
+        entry: null,
+        accountAlias: null,
+        rawAccountId: DEFAULT_ACCOUNT_ID,
+        usesPublicAlias: false
+      };
+    }
+    const matches = validEntries.filter(({ entry }) => entry === defaultEntry);
+    if (matches.length !== 1) localAccountReferenceRequired();
+    return {
+      entry: matches[0].entry,
+      accountAlias: matches[0].accountAlias,
+      rawAccountId: matches[0].entry.accountId,
+      usesPublicAlias: false
+    };
+  }
+
+  if (!isStableLocalAlias(ALIAS_NAMESPACE, "account", requestedAccountId)) {
+    localAccountReferenceRequired();
+  }
+  const matches = validEntries.filter(({ accountAlias }) => accountAlias === requestedAccountId);
+  if (matches.length !== 1) localAccountReferenceRequired();
+  return {
+    entry: matches[0].entry,
+    accountAlias: matches[0].accountAlias,
+    rawAccountId: matches[0].entry.accountId,
+    usesPublicAlias: true
+  };
+}
+
+function resolveInternalReviewId(entry, reviewId, usesPublicAlias) {
+  if (!usesPublicAlias || reviewId === undefined || reviewId === null) return reviewId;
+  const rawReviewId = getRawIdentifierForAlias(entry, ALIAS_NAMESPACE, "review", reviewId);
+  if (!rawReviewId) localAccountReferenceRequired();
+  return rawReviewId;
+}
+
+function resolveInternalScope(entry, scope, usesPublicAlias) {
+  return usesPublicAlias ? internalPermissionScopeFromStableAliases(entry, ALIAS_NAMESPACE, scope) : scope;
+}
+
+function migrateIMessageAliasesInState(state) {
+  for (const entry of Object.values(state?.[STATE_KEY]?.entries ?? {})) {
+    if (!entry || typeof entry !== "object" || typeof entry.accountId !== "string" || !entry.accountId) {
+      continue;
+    }
+
+    try {
+      const permission = getSourcePermissionStatusFromState({
+        state,
+        source: SOURCE,
+        accountId: entry.accountId
+      });
+      migrateStableLocalAliases(entry, ALIAS_NAMESPACE, {
+        permissionReview: permission?.permissionReview
+      });
+    } catch {
+      // A malformed legacy record remains private; never infer an alias.
+    }
+  }
+}
+
+async function saveIMessageLifecycleState(stateStore, state) {
+  migrateIMessageAliasesInState(state);
+  await stateStore.save(state);
+}
+
 function isHighRiskIncluded(scope) {
   return Array.isArray(scope?.sensitiveGroups?.included) && scope.sensitiveGroups.included.length > 0;
 }
 
-function publicView(entry, language, permissionReview = null) {
+function publicView(entry, language, permissionReview = null, { exposeStableIdentifiers = false } = {}) {
   const wording = copy(language);
   const isSnapshot = entry.mode === "snapshot";
   const isLocal = entry.mode === "local-macos-beta";
@@ -153,6 +250,9 @@ function publicView(entry, language, permissionReview = null) {
     source: SOURCE,
     status: entry.status,
     message,
+    account: {
+      context: stableAccountAlias(entry, ALIAS_NAMESPACE, entry.accountId)
+    },
     connection: {
       mode: isSnapshot ? "snapshot" : isLocal ? "local-macos-beta" : "beta-offered",
       beta: true,
@@ -175,8 +275,12 @@ function publicView(entry, language, permissionReview = null) {
         message: wording.identifiers
       }
     },
-    permissionReview: permissionReview ? clone(permissionReview) : null,
-    audit: clone(entry.audit)
+    permissionReview: permissionReview
+      ? (exposeStableIdentifiers
+        ? projectPermissionReviewWithStableAliases(entry, ALIAS_NAMESPACE, permissionReview)
+        : clone(permissionReview))
+      : null,
+    audit: projectAuditWithStableAliases(entry, ALIAS_NAMESPACE, entry.audit)
   };
 }
 
@@ -206,7 +310,8 @@ async function beginContentPrivacyReview({
   language,
   clock,
   reviewIdFactory,
-  mode
+  mode,
+  exposeStableIdentifiers = false
 }) {
   let review;
   try {
@@ -246,9 +351,9 @@ async function beginContentPrivacyReview({
       accountId,
       reason: error?.code ?? "metadata-review-failed"
     });
-    await stateStore.save(fallbackState);
+    await saveIMessageLifecycleState(stateStore, fallbackState);
     return {
-      iMessageBeta: publicView(fallbackEntry, languageFor(fallbackState, language)),
+      iMessageBeta: publicView(fallbackEntry, languageFor(fallbackState, language), null, { exposeStableIdentifiers }),
       metadataReviewUnavailable: true
     };
   }
@@ -263,12 +368,14 @@ async function beginContentPrivacyReview({
     reviewId: refreshedEntry.reviewId,
     mode
   });
-  await stateStore.save(refreshed);
-  return { iMessageBeta: publicView(refreshedEntry, languageFor(refreshed, language), review.permissionReview) };
+  await saveIMessageLifecycleState(stateStore, refreshed);
+  return {
+    iMessageBeta: publicView(refreshedEntry, languageFor(refreshed, language), review.permissionReview, { exposeStableIdentifiers })
+  };
 }
 
 /** Starts the non-blocking, customer-visible choice between local beta and snapshot import. */
-export async function beginIMessageBeta({ message, stateStore, accountId = "local-imessage", language, clock }) {
+export async function beginIMessageBeta({ message, stateStore, accountId = DEFAULT_ACCOUNT_ID, language, clock }) {
   assertNaturalLanguage(message);
   const state = await loadState(stateStore);
   const records = lifecycle(state);
@@ -277,7 +384,7 @@ export async function beginIMessageBeta({ message, stateStore, accountId = "loca
   if (!records.entries[key]) {
     records.entries[key] = newEntry(accountId, now);
     records.audit.push({ type: "imessage-beta-offered", at: now, accountId });
-    await stateStore.save(state);
+    await saveIMessageLifecycleState(stateStore, state);
   }
   return { iMessageBeta: publicView(records.entries[key], languageFor(state, language)) };
 }
@@ -292,7 +399,7 @@ export async function attemptIMessageLocalAccess({
   stateStore,
   localAdapter,
   connector,
-  accountId = "local-imessage",
+  accountId,
   macOSPermissionApproved = false,
   language,
   clock,
@@ -300,14 +407,24 @@ export async function attemptIMessageLocalAccess({
 }) {
   assertNaturalLanguage(message);
   const state = await loadState(stateStore);
-  const entry = assertEntry(state, accountId);
+  const resolved = resolveIMessageLifecycleAccount(state, accountId);
+  const entry = resolved.entry ?? assertEntry(state, resolved.rawAccountId);
+  const rawAccountId = resolved.rawAccountId;
   const now = isoNow(clock);
   if (entry.status !== "awaiting-macos-permission") {
-    const existing = await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId, language });
-    return { iMessageBeta: publicView(entry, languageFor(state, language), existing?.permissionReview) };
+    const existing = await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId: rawAccountId, language });
+    return {
+      iMessageBeta: publicView(entry, languageFor(state, language), existing?.permissionReview, {
+        exposeStableIdentifiers: resolved.usesPublicAlias
+      })
+    };
   }
   if (macOSPermissionApproved !== true) {
-    return { iMessageBeta: publicView(entry, languageFor(state, language)) };
+    return {
+      iMessageBeta: publicView(entry, languageFor(state, language), null, {
+        exposeStableIdentifiers: resolved.usesPublicAlias
+      })
+    };
   }
   assertLocalAdapter(localAdapter);
   assertIMessageConnector(connector);
@@ -328,22 +445,27 @@ export async function attemptIMessageLocalAccess({
   if (localStatus !== "granted") {
     entry.status = "snapshot-available";
     entry.mode = "snapshot";
-    lifecycle(state).audit.push({ type: "imessage-snapshot-fallback-available", at: now, accountId, reason: localStatus });
-    await stateStore.save(state);
-    return { iMessageBeta: publicView(entry, languageFor(state, language)) };
+    lifecycle(state).audit.push({ type: "imessage-snapshot-fallback-available", at: now, accountId: rawAccountId, reason: localStatus });
+    await saveIMessageLifecycleState(stateStore, state);
+    return {
+      iMessageBeta: publicView(entry, languageFor(state, language), null, {
+        exposeStableIdentifiers: resolved.usesPublicAlias
+      })
+    };
   }
 
   entry.status = "awaiting-content-grant";
   entry.mode = "local-macos-beta";
-  await stateStore.save(state);
+  await saveIMessageLifecycleState(stateStore, state);
   return beginContentPrivacyReview({
     stateStore,
     connector,
-    accountId,
+    accountId: rawAccountId,
     language: languageFor(state, language),
     clock,
     reviewIdFactory,
-    mode: "local-macos-beta"
+    mode: "local-macos-beta",
+    exposeStableIdentifiers: resolved.usesPublicAlias
   });
 }
 
@@ -352,7 +474,7 @@ export async function beginIMessageSnapshotImport({
   message,
   stateStore,
   connector,
-  accountId = "local-imessage",
+  accountId,
   language,
   clock,
   reviewIdFactory
@@ -360,10 +482,16 @@ export async function beginIMessageSnapshotImport({
   assertNaturalLanguage(message);
   assertIMessageConnector(connector);
   const state = await loadState(stateStore);
-  const entry = assertEntry(state, accountId);
+  const resolved = resolveIMessageLifecycleAccount(state, accountId);
+  const entry = resolved.entry ?? assertEntry(state, resolved.rawAccountId);
+  const rawAccountId = resolved.rawAccountId;
   if (entry.status === "awaiting-content-grant" && entry.mode === "snapshot") {
-    const current = await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId, language });
-    return { iMessageBeta: publicView(entry, languageFor(state, language), current?.permissionReview) };
+    const current = await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId: rawAccountId, language });
+    return {
+      iMessageBeta: publicView(entry, languageFor(state, language), current?.permissionReview, {
+        exposeStableIdentifiers: resolved.usesPublicAlias
+      })
+    };
   }
   if (entry.status !== "snapshot-available" && entry.status !== "awaiting-macos-permission") {
     throw new IMessageBetaError("SNAPSHOT_NOT_AVAILABLE", "This iMessage path is already in progress. Continue the saved review instead of starting a second import.");
@@ -373,15 +501,16 @@ export async function beginIMessageSnapshotImport({
   entry.status = "awaiting-content-grant";
   entry.snapshot = { available: true, started: true, oneTime: true, live: false, startedAt: now };
   entry.audit.push({ type: "snapshot-import-started", at: now });
-  await stateStore.save(state);
+  await saveIMessageLifecycleState(stateStore, state);
   const result = await beginContentPrivacyReview({
     stateStore,
     connector,
-    accountId,
+    accountId: rawAccountId,
     language: languageFor(state, language),
     clock,
     reviewIdFactory,
-    mode: "snapshot"
+    mode: "snapshot",
+    exposeStableIdentifiers: resolved.usesPublicAlias
   });
   if (result.metadataReviewUnavailable) {
     throw new IMessageBetaError(
@@ -396,7 +525,7 @@ export async function beginIMessageSnapshotImport({
 export async function approveIMessageSensitiveContent({
   message,
   stateStore,
-  accountId = "local-imessage",
+  accountId,
   reviewId,
   attachments = false,
   highRiskIdentifiers = false,
@@ -405,8 +534,11 @@ export async function approveIMessageSensitiveContent({
 }) {
   assertNaturalLanguage(message);
   const state = await loadState(stateStore);
-  const entry = assertEntry(state, accountId);
-  if (!entry.contactAndGroupPrivacyApplied || !entry.reviewId || entry.reviewId !== reviewId) {
+  const resolved = resolveIMessageLifecycleAccount(state, accountId);
+  const entry = resolved.entry ?? assertEntry(state, resolved.rawAccountId);
+  const rawAccountId = resolved.rawAccountId;
+  const rawReviewId = resolveInternalReviewId(entry, reviewId, resolved.usesPublicAlias);
+  if (!entry.contactAndGroupPrivacyApplied || !entry.reviewId || entry.reviewId !== rawReviewId) {
     throw new IMessageBetaError("CONTACT_PRIVACY_REVIEW_REQUIRED", "Review contacts and group-thread privacy before separately approving attachments or high-risk identifiers.");
   }
   const now = isoNow(clock);
@@ -417,13 +549,17 @@ export async function approveIMessageSensitiveContent({
   entry.audit.push({
     type: "imessage-sensitive-content-reviewed",
     at: now,
-    reviewId,
+    reviewId: rawReviewId,
     attachmentsApproved: attachments === true,
     highRiskIdentifiersApproved: highRiskIdentifiers === true
   });
-  await stateStore.save(state);
-  const current = await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId, language });
-  return { iMessageBeta: publicView(entry, languageFor(state, language), current?.permissionReview) };
+  await saveIMessageLifecycleState(stateStore, state);
+  const current = await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId: rawAccountId, language });
+  return {
+    iMessageBeta: publicView(entry, languageFor(state, language), current?.permissionReview, {
+      exposeStableIdentifiers: resolved.usesPublicAlias
+    })
+  };
 }
 
 /** Grants the normal QWA-139 message-body scope while enforcing iMessage's separate high-risk gate. */
@@ -431,7 +567,7 @@ export async function grantIMessageContent({
   message,
   stateStore,
   connector,
-  accountId = "local-imessage",
+  accountId,
   reviewId,
   scope,
   language,
@@ -441,11 +577,15 @@ export async function grantIMessageContent({
   assertNaturalLanguage(message);
   assertIMessageConnector(connector);
   const state = await loadState(stateStore);
-  const entry = assertEntry(state, accountId);
-  if (entry.status !== "awaiting-content-grant" || entry.reviewId !== reviewId) {
+  const resolved = resolveIMessageLifecycleAccount(state, accountId);
+  const entry = resolved.entry ?? assertEntry(state, resolved.rawAccountId);
+  const rawAccountId = resolved.rawAccountId;
+  const rawReviewId = resolveInternalReviewId(entry, reviewId, resolved.usesPublicAlias);
+  const rawScope = resolveInternalScope(entry, scope, resolved.usesPublicAlias);
+  if (entry.status !== "awaiting-content-grant" || entry.reviewId !== rawReviewId) {
     throw new IMessageBetaError("IMESSAGE_REVIEW_NOT_READY", "Continue the saved iMessage privacy review before approving any message content.");
   }
-  if (isHighRiskIncluded(scope) && !entry.sensitiveApprovals.highRiskIdentifiers.approved) {
+  if (isHighRiskIncluded(rawScope) && !entry.sensitiveApprovals.highRiskIdentifiers.approved) {
     throw new IMessageBetaError("HIGH_RISK_APPROVAL_REQUIRED", "High-risk identifiers remain excluded. Review and approve them separately before including that category in this iMessage scope.");
   }
   const granted = await grantSourcePermission({
@@ -453,19 +593,23 @@ export async function grantIMessageContent({
     stateStore,
     connector,
     source: SOURCE,
-    accountId,
-    reviewId,
-    scope,
+    accountId: rawAccountId,
+    reviewId: rawReviewId,
+    scope: rawScope,
     language,
     clock,
     grantIdFactory
   });
   const refreshed = await loadState(stateStore);
-  const refreshedEntry = assertEntry(refreshed, accountId);
+  const refreshedEntry = assertEntry(refreshed, rawAccountId);
   refreshedEntry.status = "ready-to-process";
-  refreshedEntry.audit.push({ type: "imessage-content-granted", at: isoNow(clock), reviewId, grantId: granted.permissionReview.activeGrant?.grantId ?? null });
-  await stateStore.save(refreshed);
-  return { iMessageBeta: publicView(refreshedEntry, languageFor(refreshed, language), granted.permissionReview) };
+  refreshedEntry.audit.push({ type: "imessage-content-granted", at: isoNow(clock), reviewId: rawReviewId, grantId: granted.permissionReview.activeGrant?.grantId ?? null });
+  await saveIMessageLifecycleState(stateStore, refreshed);
+  return {
+    iMessageBeta: publicView(refreshedEntry, languageFor(refreshed, language), granted.permissionReview, {
+      exposeStableIdentifiers: resolved.usesPublicAlias
+    })
+  };
 }
 
 /**
@@ -477,7 +621,7 @@ export async function fetchApprovedIMessageContent({
   message,
   stateStore,
   connector,
-  accountId = "local-imessage",
+  accountId,
   reviewId,
   language,
   clock
@@ -488,8 +632,11 @@ export async function fetchApprovedIMessageContent({
     throw new TypeError("An iMessage connector with setIMessageContentPolicy() is required to enforce attachment and identifier exclusions.");
   }
   const state = await loadState(stateStore);
-  const entry = assertEntry(state, accountId);
-  if (entry.status !== "ready-to-process" || entry.reviewId !== reviewId) {
+  const resolved = resolveIMessageLifecycleAccount(state, accountId);
+  const entry = resolved.entry ?? assertEntry(state, resolved.rawAccountId);
+  const rawAccountId = resolved.rawAccountId;
+  const rawReviewId = resolveInternalReviewId(entry, reviewId, resolved.usesPublicAlias);
+  if (entry.status !== "ready-to-process" || entry.reviewId !== rawReviewId) {
     throw new IMessageBetaError("IMESSAGE_GRANT_REQUIRED", "No iMessage content was processed because the saved granular review is not ready.");
   }
   await connector.setIMessageContentPolicy({
@@ -501,40 +648,84 @@ export async function fetchApprovedIMessageContent({
     stateStore,
     connector,
     source: SOURCE,
-    accountId,
-    reviewId,
+    accountId: rawAccountId,
+    reviewId: rawReviewId,
     language,
     clock
   });
   const refreshed = await loadState(stateStore);
-  const refreshedEntry = assertEntry(refreshed, accountId);
+  const refreshedEntry = assertEntry(refreshed, rawAccountId);
   refreshedEntry.status = "processed";
-  refreshedEntry.audit.push({ type: "imessage-approved-content-processed", at: isoNow(clock), reviewId, recordCount: fetched.approvedRecords.length });
-  await stateStore.save(refreshed);
+  refreshedEntry.audit.push({ type: "imessage-approved-content-processed", at: isoNow(clock), reviewId: rawReviewId, recordCount: fetched.approvedRecords.length });
+  await saveIMessageLifecycleState(stateStore, refreshed);
   return {
-    iMessageBeta: publicView(refreshedEntry, languageFor(refreshed, language), fetched.permissionReview),
-    approvedRecords: fetched.approvedRecords
+    iMessageBeta: publicView(refreshedEntry, languageFor(refreshed, language), fetched.permissionReview, {
+      exposeStableIdentifiers: resolved.usesPublicAlias
+    }),
+    approvedRecords: resolved.usesPublicAlias
+      ? projectApprovedReferencesWithStableAliases(
+        refreshedEntry,
+        ALIAS_NAMESPACE,
+        fetched.approvedRecords,
+        { removeStableLink: true }
+      )
+      : clone(fetched.approvedRecords)
   };
 }
 
 /** Revokes the standard read-only grant; it cannot send, alter, or delete an iMessage. */
-export async function revokeIMessageContent({ message, stateStore, connector, accountId = "local-imessage", reviewId, language, clock }) {
+export async function revokeIMessageContent({ message, stateStore, connector, accountId, reviewId, language, clock }) {
   assertNaturalLanguage(message);
-  const revoked = await revokeSourcePermission({ message, stateStore, connector, source: SOURCE, accountId, reviewId, language, clock });
   const state = await loadState(stateStore);
-  const entry = assertEntry(state, accountId);
-  entry.status = "snapshot-available";
-  entry.mode = "snapshot";
-  entry.audit.push({ type: "imessage-content-revoked", at: isoNow(clock), reviewId });
-  await stateStore.save(state);
-  return { iMessageBeta: publicView(entry, languageFor(state, language), revoked.permissionReview) };
+  const resolved = resolveIMessageLifecycleAccount(state, accountId);
+  const entry = resolved.entry ?? assertEntry(state, resolved.rawAccountId);
+  const rawAccountId = resolved.rawAccountId;
+  const rawReviewId = resolveInternalReviewId(entry, reviewId, resolved.usesPublicAlias);
+  const revoked = await revokeSourcePermission({
+    message,
+    stateStore,
+    connector,
+    source: SOURCE,
+    accountId: rawAccountId,
+    reviewId: rawReviewId,
+    language,
+    clock
+  });
+  const refreshed = await loadState(stateStore);
+  const refreshedEntry = assertEntry(refreshed, rawAccountId);
+  refreshedEntry.status = "snapshot-available";
+  refreshedEntry.mode = "snapshot";
+  refreshedEntry.audit.push({ type: "imessage-content-revoked", at: isoNow(clock), reviewId: rawReviewId });
+  await saveIMessageLifecycleState(stateStore, refreshed);
+  return {
+    iMessageBeta: publicView(refreshedEntry, languageFor(refreshed, language), revoked.permissionReview, {
+      exposeStableIdentifiers: resolved.usesPublicAlias
+    })
+  };
 }
 
 /** Read-only status lookup; it never invokes a local adapter or connector. */
-export async function getIMessageBetaStatus({ stateStore, accountId = "local-imessage", language }) {
+export async function getIMessageBetaStatus({ stateStore, accountId, language }) {
   const state = await loadState(stateStore);
-  const entry = lifecycle(state).entries[entryKey(accountId)];
+  const resolved = resolveIMessageLifecycleAccount(state, accountId);
+  const entry = resolved.entry;
   if (!entry) return null;
-  const permission = await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId, language });
-  return { iMessageBeta: publicView(entry, languageFor(state, language), permission?.permissionReview) };
+  const resolvedLanguage = languageFor(state, language);
+  const permission = getSourcePermissionStatusFromState({
+    state,
+    source: SOURCE,
+    accountId: resolved.rawAccountId,
+    language: resolvedLanguage
+  });
+  return {
+    iMessageBeta: publicView(entry, resolvedLanguage, permission?.permissionReview, {
+      exposeStableIdentifiers: resolved.usesPublicAlias
+    }),
+    sourceStatus: getPersistedAdapterSourceStatus({
+      state,
+      adapter: SOURCE_ADAPTER_NAMES.IMESSAGE,
+      accountId: resolved.accountAlias,
+      language: resolvedLanguage
+    })
+  };
 }

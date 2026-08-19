@@ -1,7 +1,10 @@
 # Customer-owned state and knowledge must never enter the public installer repository.
 .qwave-second-brain/
+.qwave-second-brain-staging/
 customer-state/
 customer-vaults/
+generated-vaults/
+private-state/
 staging/
 *.local.json
 .env

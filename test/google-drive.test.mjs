@@ -137,6 +137,40 @@ async function connectAndReview({ stateStore, connector, plugin, language, revie
   });
 }
 
+test("Drive lifecycle saves create opaque aliases before any final handoff", async () => {
+  await withDriveFixture(async ({ stateStore, connector, plugin }) => {
+    await connectAndReview({
+      stateStore,
+      connector,
+      plugin,
+      reviewId: "drive-writer-review"
+    });
+
+    const state = await stateStore.load();
+    const [entry] = Object.values(state.googleDriveLifecycle.entries);
+    const accountAlias = entry.publicIdentifierAliases.mappings.find(
+      (mapping) => mapping.kind === "account" && mapping.raw === accountId
+    );
+    const reviewAlias = entry.publicIdentifierAliases.mappings.find(
+      (mapping) => mapping.kind === "review" && mapping.raw === "drive-writer-review"
+    );
+
+    assert.equal(entry.publicIdentifierAliases.namespace, "drive");
+    assert.equal(accountAlias.alias.startsWith("local-drive-account-"), true);
+    assert.notEqual(accountAlias.alias, accountId);
+    assert.equal(reviewAlias.alias.startsWith("local-drive-review-"), true);
+    assert.notEqual(reviewAlias.alias, "drive-writer-review");
+  }, {
+    authorization: {
+      status: "authorized",
+      accountId,
+      readOnly: true,
+      metadataOnly: true,
+      approvedFolderIds: ["business"]
+    }
+  });
+});
+
 test("Drive remains separate and metadata-only until the customer explicitly approves selected-folder authorization", async () => {
   await withDriveFixture(async ({ stateStore, connector, plugin }) => {
     const offered = await beginGoogleDriveConnection({

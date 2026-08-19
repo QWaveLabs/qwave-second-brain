@@ -1,3 +1,5 @@
+import { SENSITIVE_CATEGORIES } from "./setup-source-permissions.mjs";
+
 /**
  * Test-only read-only connector for QWA-139. It holds opaque source records and
  * exposes metadata first. It never returns a raw body, even after a permitted
@@ -27,22 +29,49 @@ function recordFitsScope(record, scope) {
   const conversationId = record.kind === "conversation" ? record.id : (record.conversation ?? null);
   if (!inList(conversationId, scope.conversations)) return false;
   if (!inList(record.category, scope.categories)) return false;
+  if (record.participantIds != null && !Array.isArray(record.participantIds)) return false;
+  const participants = record.participantIds ?? [];
+  const allowedPeople = new Set(scope.people?.allowed ?? []);
+  const blockedPeople = new Set(scope.people?.blocked ?? []);
   const isExplicitBlockedGroupException = record.kind === "conversation"
     && record.isGroup === true
     && scope.blockedGroupConversationExceptions.includes(record.id);
-  const excludedParticipants = (record.participantIds ?? []).filter((id) => scope.exclusions.people.includes(id));
+  const excludedParticipants = participants.filter((id) => scope.exclusions.people.includes(id));
   if (isExplicitBlockedGroupException) {
     // A narrow group exception can bypass only the explicitly Blocked member;
     // a Restricted participant remains a hard content exclusion.
-    if (excludedParticipants.some((id) => !scope.people.blocked.includes(id))) return false;
-  } else if (excludedParticipants.length > 0) {
+    if (participants.some((id) => !allowedPeople.has(id) && !blockedPeople.has(id))) return false;
+    if (excludedParticipants.some((id) => !blockedPeople.has(id))) return false;
+  } else if (excludedParticipants.length > 0 || participants.some((id) => !allowedPeople.has(id))) {
     return false;
   }
+  const declaredSensitive = record.sensitiveCategories == null
+    ? []
+    : Array.isArray(record.sensitiveCategories)
+      ? record.sensitiveCategories
+      : [record.sensitiveCategories];
+  const knownSensitive = declaredSensitive
+    .filter((category) => typeof category === "string" && category.trim() && SENSITIVE_CATEGORIES.includes(category.trim()))
+    .map((category) => category.trim());
+  // Keep the simulated fetch path aligned with metadata normalization: an
+  // unknown or malformed sensitivity declaration is uncertainty, not approval.
+  const hasUnknownSensitivity = declaredSensitive.some((category) => (
+    typeof category !== "string"
+    || !category.trim()
+    || !SENSITIVE_CATEGORIES.includes(category.trim())
+  ));
+  const hasMalformedUncertaintyMarker = record.uncertainSensitivity !== undefined
+    && typeof record.uncertainSensitivity !== "boolean";
   const sensitiveCategories = [
-    ...record.sensitiveCategories ?? [],
-    ...(record.uncertainSensitivity === true ? ["uncertain-sensitivity"] : [])
+    ...knownSensitive,
+    ...(record.uncertainSensitivity === true || hasUnknownSensitivity || hasMalformedUncertaintyMarker
+      ? ["uncertain-sensitivity"]
+      : [])
   ];
-  if (sensitiveCategories.some((category) => scope.sensitiveGroups.excluded.includes(category))) return false;
+  if (sensitiveCategories.some((category) => (
+    scope.sensitiveGroups.excluded.includes(category)
+    || !scope.sensitiveGroups.included.includes(category)
+  ))) return false;
   return true;
 }
 
@@ -84,7 +113,10 @@ export class SimulatedReadOnlyConnector {
         uncertainSensitivity: item.uncertainSensitivity,
         isGroup: item.isGroup,
         participantIds: item.participantIds,
-        label: item.label
+        label: item.label,
+        stableLink: item.stableLink,
+        webUrl: item.webUrl,
+        url: item.url
       }))
     };
   }

@@ -10,11 +10,14 @@
 import {
   DEFAULT_PERMISSION_WINDOWS,
   SENSITIVE_CATEGORIES,
-  beginSourcePermissionReview,
-  fetchApprovedSourceContent,
+  beginSourcePermissionReviewWithinStateLock,
+  fetchApprovedSourceContentWithinStateLock,
   getSourcePermissionStatus,
-  grantSourcePermission,
-  revokeSourcePermission
+  getSourcePermissionStatusFromState,
+  grantSourcePermissionWithinStateLock,
+  revokeSourcePermissionWithinStateLock,
+  withSourcePermissionStateReadLock,
+  withSourcePermissionStateLock
 } from "../permissions/setup-source-permissions.mjs";
 
 const SOURCE = "google-calendar";
@@ -508,7 +511,7 @@ async function revokeInvalidatedGrant({ message, stateStore, connector, accountI
   const current = await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId, language });
   if (!current?.permissionReview?.activeGrant) return current?.permissionReview ?? null;
   try {
-    const revoked = await revokeSourcePermission({ message, stateStore, connector, source: SOURCE, accountId, reviewId, language, clock });
+    const revoked = await revokeSourcePermissionWithinStateLock({ message, stateStore, connector, source: SOURCE, accountId, reviewId, language, clock });
     return revoked.permissionReview;
   } catch {
     return current.permissionReview;
@@ -526,7 +529,7 @@ function statusForPermission(permissionReview) {
  * Starts the separate, natural-language Calendar review. Discovery is metadata
  * only; an injected adapter remains the only source of event-shaped data.
  */
-export async function beginGoogleCalendarReview({ message, stateStore, connector, language, clock, reviewIdFactory }) {
+async function beginGoogleCalendarReviewInternal({ message, stateStore, connector, language, clock, reviewIdFactory }) {
   assertNaturalLanguage(message);
   assertCalendarConnector(connector);
   let state = await loadState(stateStore);
@@ -594,7 +597,7 @@ export async function beginGoogleCalendarReview({ message, stateStore, connector
   let bounded;
   try {
     bounded = new CalendarBoundedConnector(connector);
-    review = await beginSourcePermissionReview({
+    review = await beginSourcePermissionReviewWithinStateLock({
       message,
       stateStore,
       connector: bounded,
@@ -632,8 +635,12 @@ export async function beginGoogleCalendarReview({ message, stateStore, connector
   return { googleCalendar: publicView(reviewedEntry, languageFor(state, language), review.permissionReview) };
 }
 
+export async function beginGoogleCalendarReview(args) {
+  return withSourcePermissionStateLock(args?.stateStore, () => beginGoogleCalendarReviewInternal(args));
+}
+
 /** Records an explicit granular Calendar grant without any calendar mutation. */
-export async function grantGoogleCalendarContent({ message, stateStore, connector, accountId, reviewId, scope, language, clock, grantIdFactory }) {
+async function grantGoogleCalendarContentInternal({ message, stateStore, connector, accountId, reviewId, scope, language, clock, grantIdFactory }) {
   assertNaturalLanguage(message);
   assertCalendarConnector(connector);
   let state = await loadState(stateStore);
@@ -662,7 +669,7 @@ export async function grantGoogleCalendarContent({ message, stateStore, connecto
 
   let granted;
   try {
-    granted = await grantSourcePermission({
+    granted = await grantSourcePermissionWithinStateLock({
       message,
       stateStore,
       connector: new CalendarBoundedConnector(connector, { reviewedRecordsById: entry.reviewedRecordsById }),
@@ -694,8 +701,12 @@ export async function grantGoogleCalendarContent({ message, stateStore, connecto
   return { googleCalendar: publicView(grantedEntry, languageFor(state, language), granted.permissionReview) };
 }
 
+export async function grantGoogleCalendarContent(args) {
+  return withSourcePermissionStateLock(args?.stateStore, () => grantGoogleCalendarContentInternal(args));
+}
+
 /** Fetches only opaque approved event references and reports empty/partial/failure truthfully. */
-export async function fetchApprovedGoogleCalendarContent({ message, stateStore, connector, accountId, reviewId, language, clock }) {
+async function fetchApprovedGoogleCalendarContentInternal({ message, stateStore, connector, accountId, reviewId, language, clock }) {
   assertNaturalLanguage(message);
   assertCalendarConnector(connector);
   let state = await loadState(stateStore);
@@ -724,7 +735,7 @@ export async function fetchApprovedGoogleCalendarContent({ message, stateStore, 
 
   let fetched;
   try {
-    fetched = await fetchApprovedSourceContent({
+    fetched = await fetchApprovedSourceContentWithinStateLock({
       message,
       stateStore,
       connector: new CalendarBoundedConnector(connector, { reviewedRecordsById: entry.reviewedRecordsById }),
@@ -762,11 +773,15 @@ export async function fetchApprovedGoogleCalendarContent({ message, stateStore, 
   return { googleCalendar: publicView(fetchedEntry, languageFor(state, language), fetched.permissionReview), approvedRecords: fetched.approvedRecords };
 }
 
+export async function fetchApprovedGoogleCalendarContent(args) {
+  return withSourcePermissionStateLock(args?.stateStore, () => fetchApprovedGoogleCalendarContentInternal(args));
+}
+
 /** Revokes only the local grant state; it never changes a Calendar event. */
-export async function revokeGoogleCalendarContent({ message, stateStore, connector, accountId, reviewId, language, clock }) {
+async function revokeGoogleCalendarContentInternal({ message, stateStore, connector, accountId, reviewId, language, clock }) {
   assertNaturalLanguage(message);
   assertCalendarConnector(connector);
-  const revoked = await revokeSourcePermission({ message, stateStore, connector, source: SOURCE, accountId, reviewId, language, clock });
+  const revoked = await revokeSourcePermissionWithinStateLock({ message, stateStore, connector, source: SOURCE, accountId, reviewId, language, clock });
   const state = await loadState(stateStore);
   const entry = lifecycle(state).entries[entryKey(accountId)];
   entry.status = "revoked";
@@ -775,11 +790,19 @@ export async function revokeGoogleCalendarContent({ message, stateStore, connect
   return { googleCalendar: publicView(entry, languageFor(state, language), revoked.permissionReview) };
 }
 
+export async function revokeGoogleCalendarContent(args) {
+  return withSourcePermissionStateLock(args?.stateStore, () => revokeGoogleCalendarContentInternal(args));
+}
+
 /** Read-only lifecycle status lookup; it never invokes the Calendar adapter. */
-export async function getGoogleCalendarStatus({ stateStore, accountId, language }) {
+async function getGoogleCalendarStatusInternal({ stateStore, accountId, language }) {
   const state = await loadState(stateStore);
   const entry = lifecycle(state).entries[entryKey(accountId)];
   if (!entry) return null;
-  const permission = await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId, language });
+  const permission = getSourcePermissionStatusFromState({ state, source: SOURCE, accountId, language });
   return { googleCalendar: publicView(entry, languageFor(state, language), permission?.permissionReview) };
+}
+
+export async function getGoogleCalendarStatus(args) {
+  return withSourcePermissionStateReadLock(args?.stateStore, () => getGoogleCalendarStatusInternal(args));
 }

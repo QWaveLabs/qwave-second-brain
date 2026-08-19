@@ -15,6 +15,11 @@
     "test:qwa-141": "node --test test/onboarding.test.mjs",
     "test:qwa-150": "node --test test/imessage-beta.test.mjs",
     "test:qwa-142": "node --test test/google-drive.test.mjs",
-    "test:qwa-145": "node --test test/gmail-readonly.test.mjs"
+    "test:qwa-145": "node --test test/gmail-readonly.test.mjs",
+    "test:qwa-148": "node --test test/slack.test.mjs",
+    "test:qwa-146": "node --test test/approved-record-compiler.test.mjs",
+    "test:qwa-147": "node --test test/whatsapp-snapshot.test.mjs",
+    "test:qwa-149": "node --test test/source-status.test.mjs",
+    "proof:qwa-149": "node scripts/export-qwa-149-source-status-proof.mjs"
   }
 }

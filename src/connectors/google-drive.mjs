@@ -12,13 +12,30 @@ import {
   beginSourcePermissionReview,
   fetchApprovedSourceContent,
   getSourcePermissionStatus,
+  getSourcePermissionStatusFromState,
   grantSourcePermission,
   PermissionLifecycleError,
   revokeSourcePermission
 } from "../permissions/setup-source-permissions.mjs";
 
+import {
+  getRawIdentifierForAlias,
+  getStableLocalAlias,
+  internalPermissionScopeFromStableAliases,
+  isStableLocalAlias,
+  migrateStableLocalAliases,
+  projectApprovedReferencesWithStableAliases,
+  projectAuditWithStableAliases,
+  projectPermissionReviewWithStableAliases,
+  stableAccountAlias,
+  validStableLocalAliasLifecycleEntries
+} from "./stable-local-aliases.mjs";
+import { getPersistedAdapterSourceStatus, SOURCE_ADAPTER_NAMES } from "../source-status.mjs";
+
 const STATE_KEY = "googleDriveLifecycle";
 const SOURCE = "drive";
+const ALIAS_NAMESPACE = "drive";
+const DEFAULT_ACCOUNT_ID = "google-drive";
 const AUTHORIZATION_STATUSES = new Set(["authorized", "partial", "cancelled", "denied", "revoked", "unavailable"]);
 const OPAQUE_GOOGLE_ID = /^[A-Za-z0-9_-]{1,160}$/;
 const REVOKED_AUTHORIZATION_CODES = new Set([
@@ -143,6 +160,101 @@ function assertEntry(state, accountId) {
     throw new GoogleDriveLifecycleError("DRIVE_CONNECTION_NOT_STARTED", "Tell me you would like to connect Google Drive first, and I will guide the folder-scoped review.");
   }
   return entry;
+}
+
+function localAccountReferenceRequired() {
+  throw new GoogleDriveLifecycleError(
+    "DRIVE_LOCAL_ACCOUNT_REFERENCE_REQUIRED",
+    "I could not safely match that local Google Drive account reference. Continue from the saved guided Drive review."
+  );
+}
+
+/**
+ * Public post-begin calls must use the durable local alias. Resolving across
+ * the whole lifecycle collection makes malformed and colliding legacy entries
+ * fail closed instead of accidentally selecting whichever entry is visited
+ * first.
+ */
+function resolveDriveLifecycleAccount(state, requestedAccountId) {
+  const entries = lifecycle(state).entries;
+  const validEntries = validStableLocalAliasLifecycleEntries(Object.values(entries), ALIAS_NAMESPACE);
+
+  if (requestedAccountId === undefined) {
+    const defaultEntry = entries[entryKey(DEFAULT_ACCOUNT_ID)];
+    if (!defaultEntry) {
+      return {
+        entry: null,
+        accountAlias: null,
+        rawAccountId: DEFAULT_ACCOUNT_ID,
+        usesPublicAlias: false
+      };
+    }
+    const matches = validEntries.filter(({ entry }) => entry === defaultEntry);
+    if (matches.length !== 1) localAccountReferenceRequired();
+    return {
+      entry: matches[0].entry,
+      accountAlias: matches[0].accountAlias,
+      rawAccountId: matches[0].entry.accountId,
+      usesPublicAlias: false
+    };
+  }
+
+  if (!isStableLocalAlias(ALIAS_NAMESPACE, "account", requestedAccountId)) {
+    localAccountReferenceRequired();
+  }
+  const matches = validEntries.filter(({ accountAlias }) => accountAlias === requestedAccountId);
+  if (matches.length !== 1) localAccountReferenceRequired();
+  return {
+    entry: matches[0].entry,
+    accountAlias: matches[0].accountAlias,
+    rawAccountId: matches[0].entry.accountId,
+    usesPublicAlias: true
+  };
+}
+
+function resolveInternalReviewId(entry, reviewId, usesPublicAlias) {
+  if (!usesPublicAlias || reviewId === undefined || reviewId === null) return reviewId;
+  const rawReviewId = getRawIdentifierForAlias(entry, ALIAS_NAMESPACE, "review", reviewId);
+  if (!rawReviewId) localAccountReferenceRequired();
+  return rawReviewId;
+}
+
+function resolveInternalScope(entry, scope, usesPublicAlias) {
+  return usesPublicAlias
+    ? internalPermissionScopeFromStableAliases(entry, ALIAS_NAMESPACE, scope)
+    : scope;
+}
+
+function migrateDriveAliasesInState(state) {
+  for (const entry of Object.values(state?.[STATE_KEY]?.entries ?? {})) {
+    if (!entry || typeof entry !== "object" || typeof entry.accountId !== "string" || !entry.accountId) {
+      continue;
+    }
+
+    try {
+      const permission = getSourcePermissionStatusFromState({
+        state,
+        source: SOURCE,
+        accountId: entry.accountId
+      });
+      migrateStableLocalAliases(entry, ALIAS_NAMESPACE, {
+        permissionReview: permission?.permissionReview,
+        approvedRecords: [
+          ...Object.values(entry.normalizedMetadataById ?? {}),
+          ...(Array.isArray(entry.authorizedFolderIds)
+            ? entry.authorizedFolderIds.map((folderId) => ({ folderId }))
+            : [])
+        ]
+      });
+    } catch {
+      // A malformed legacy record remains private; never infer an alias.
+    }
+  }
+}
+
+async function saveDriveLifecycleState(stateStore, state) {
+  migrateDriveAliasesInState(state);
+  await stateStore.save(state);
 }
 
 function assertPlugin(plugin) {
@@ -354,8 +466,14 @@ export class FolderBoundedDriveConnector {
   }
 }
 
-function publicView(entry, language, permissionReview = null) {
+function publicView(entry, language, permissionReview = null, { exposeStableIdentifiers = false } = {}) {
   const wording = copy(language);
+  const accountAlias = stableAccountAlias(entry, ALIAS_NAMESPACE, entry.accountId);
+  const authorizedFolderIds = exposeStableIdentifiers
+    ? (Array.isArray(entry.authorizedFolderIds) ? entry.authorizedFolderIds : [])
+      .map((folderId) => getStableLocalAlias(entry, ALIAS_NAMESPACE, "reference", folderId))
+      .filter(Boolean)
+    : clone(Array.isArray(entry.authorizedFolderIds) ? entry.authorizedFolderIds : []);
   const partial = entry.authorization.status === "partial";
   const message = entry.status === "awaiting-authorization"
     ? wording.awaitingAuthorization
@@ -378,6 +496,7 @@ function publicView(entry, language, permissionReview = null) {
     source: SOURCE,
     status: entry.status,
     message,
+    account: { context: accountAlias },
     connection: {
       separateFrom: ["gmail", "calendar"],
       authorizationStatus: entry.authorization.status,
@@ -392,13 +511,17 @@ function publicView(entry, language, permissionReview = null) {
       canDeleteFiles: false
     },
     folderBoundary: {
-      authorizedFolderIds: clone(entry.authorizedFolderIds),
+      authorizedFolderIds,
       selectionRequired: true,
       dateWindow: "selected-folders-only"
     },
     verificationBoundary: wording.metadataOnly,
-    permissionReview: permissionReview ? clone(permissionReview) : null,
-    audit: clone(entry.audit)
+    permissionReview: permissionReview
+      ? (exposeStableIdentifiers
+        ? projectPermissionReviewWithStableAliases(entry, ALIAS_NAMESPACE, permissionReview)
+        : clone(permissionReview))
+      : null,
+    audit: projectAuditWithStableAliases(entry, ALIAS_NAMESPACE, entry.audit)
   };
 }
 
@@ -413,7 +536,16 @@ function nextStatusForAuthorization(status) {
   return "authorization-unavailable";
 }
 
-async function startFolderReview({ stateStore, connector, accountId, entry, language, clock, reviewIdFactory }) {
+async function startFolderReview({
+  stateStore,
+  connector,
+  accountId,
+  entry,
+  language,
+  clock,
+  reviewIdFactory,
+  exposeStableIdentifiers = false
+}) {
   const bounded = new FolderBoundedDriveConnector(connector, entry.authorizedFolderIds);
   let review;
   try {
@@ -443,8 +575,11 @@ async function startFolderReview({ stateStore, connector, accountId, entry, lang
     failedEntry.reviewId = null;
     failedEntry.normalizedMetadataById = {};
     failedEntry.audit.push({ type: "drive-metadata-review-unavailable", at: isoNow(clock), reason: error?.code ?? "metadata-review-failed", contentBodiesRead: false });
-    await stateStore.save(failedState);
-    return { drive: publicView(failedEntry, languageFor(failedState, language)), metadataReviewUnavailable: true };
+    await saveDriveLifecycleState(stateStore, failedState);
+    return {
+      drive: publicView(failedEntry, languageFor(failedState, language), null, { exposeStableIdentifiers }),
+      metadataReviewUnavailable: true
+    };
   }
 
   const refreshed = await loadState(stateStore);
@@ -453,12 +588,14 @@ async function startFolderReview({ stateStore, connector, accountId, entry, lang
   refreshedEntry.reviewId = review.permissionReview.permissionRequest.reviewId;
   refreshedEntry.normalizedMetadataById = normalizeDriveMetadata(bounded.lastMetadata, refreshedEntry.authorizedFolderIds, refreshedEntry.accountId);
   refreshedEntry.audit.push({ type: "drive-folder-metadata-reviewed", at: isoNow(clock), reviewId: refreshedEntry.reviewId, contentBodiesRead: false });
-  await stateStore.save(refreshed);
-  return { drive: publicView(refreshedEntry, languageFor(refreshed, language), review.permissionReview) };
+  await saveDriveLifecycleState(stateStore, refreshed);
+  return {
+    drive: publicView(refreshedEntry, languageFor(refreshed, language), review.permissionReview, { exposeStableIdentifiers })
+  };
 }
 
 /** Starts the separate, normal-language Drive connection; it does not authorize or read anything. */
-export async function beginGoogleDriveConnection({ message, stateStore, accountId = "google-drive", language, clock }) {
+export async function beginGoogleDriveConnection({ message, stateStore, accountId = DEFAULT_ACCOUNT_ID, language, clock }) {
   assertNaturalLanguage(message);
   const state = await loadState(stateStore);
   const records = lifecycle(state);
@@ -467,7 +604,7 @@ export async function beginGoogleDriveConnection({ message, stateStore, accountI
     const now = isoNow(clock);
     records.entries[key] = newEntry(accountId, now);
     records.audit.push({ type: "drive-connection-offered", at: now, accountId });
-    await stateStore.save(state);
+    await saveDriveLifecycleState(stateStore, state);
   }
   return { drive: publicView(records.entries[key], languageFor(state, language)) };
 }
@@ -478,7 +615,7 @@ export async function authorizeGoogleDriveReadOnly({
   stateStore,
   plugin,
   connector,
-  accountId = "google-drive",
+  accountId,
   authorizationApproved = false,
   language,
   clock,
@@ -486,12 +623,24 @@ export async function authorizeGoogleDriveReadOnly({
 }) {
   assertNaturalLanguage(message);
   const state = await loadState(stateStore);
-  const entry = assertEntry(state, accountId);
+  const resolved = resolveDriveLifecycleAccount(state, accountId);
+  const entry = resolved.entry ?? assertEntry(state, resolved.rawAccountId);
+  const rawAccountId = resolved.rawAccountId;
   if (entry.status === "awaiting-folder-review" || entry.status === "ready-to-fetch" || entry.status === "imported") {
-    const existing = await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId, language });
-    return { drive: publicView(entry, languageFor(state, language), existing?.permissionReview) };
+    const existing = await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId: rawAccountId, language });
+    return {
+      drive: publicView(entry, languageFor(state, language), existing?.permissionReview, {
+        exposeStableIdentifiers: resolved.usesPublicAlias
+      })
+    };
   }
-  if (authorizationApproved !== true) return { drive: publicView(entry, languageFor(state, language)) };
+  if (authorizationApproved !== true) {
+    return {
+      drive: publicView(entry, languageFor(state, language), null, {
+        exposeStableIdentifiers: resolved.usesPublicAlias
+      })
+    };
+  }
   assertPlugin(plugin);
   assertConnector(connector);
 
@@ -500,7 +649,7 @@ export async function authorizeGoogleDriveReadOnly({
   try {
     result = await plugin.authorizeFolderScopedReadOnly({
       source: SOURCE,
-      accountId,
+      accountId: rawAccountId,
       purpose: "Review only selected Google Drive folders for a private second brain.",
       requestedAccess: "metadata-only-read-only"
     });
@@ -523,16 +672,29 @@ export async function authorizeGoogleDriveReadOnly({
     readOnly: result?.readOnly === true,
     metadataOnly: result?.metadataOnly === true
   });
-  if (!["authorized", "partial"].includes(status) || result?.readOnly !== true || result?.metadataOnly !== true || folders.length === 0 || result?.accountId !== accountId) {
-    entry.status = result?.accountId && result.accountId !== accountId ? "authorization-unavailable" : nextStatusForAuthorization(status);
+  if (!["authorized", "partial"].includes(status) || result?.readOnly !== true || result?.metadataOnly !== true || folders.length === 0 || result?.accountId !== rawAccountId) {
+    entry.status = result?.accountId && result.accountId !== rawAccountId ? "authorization-unavailable" : nextStatusForAuthorization(status);
     entry.authorizedFolderIds = [];
-    await stateStore.save(state);
-    return { drive: publicView(entry, languageFor(state, language)) };
+    await saveDriveLifecycleState(stateStore, state);
+    return {
+      drive: publicView(entry, languageFor(state, language), null, {
+        exposeStableIdentifiers: resolved.usesPublicAlias
+      })
+    };
   }
   entry.authorizedFolderIds = folders;
   entry.status = "authorizing-folder-review";
-  await stateStore.save(state);
-  return startFolderReview({ stateStore, connector, accountId, entry, language: languageFor(state, language), clock, reviewIdFactory });
+  await saveDriveLifecycleState(stateStore, state);
+  return startFolderReview({
+    stateStore,
+    connector,
+    accountId: rawAccountId,
+    entry,
+    language: languageFor(state, language),
+    clock,
+    reviewIdFactory,
+    exposeStableIdentifiers: resolved.usesPublicAlias
+  });
 }
 
 /** Saves a selected-folder-only grant; a folder outside the plugin allowlist cannot be added. */
@@ -540,7 +702,7 @@ export async function grantGoogleDriveFolderContent({
   message,
   stateStore,
   connector,
-  accountId = "google-drive",
+  accountId,
   reviewId,
   scope,
   language,
@@ -550,8 +712,12 @@ export async function grantGoogleDriveFolderContent({
   assertNaturalLanguage(message);
   assertConnector(connector);
   const state = await loadState(stateStore);
-  const entry = assertEntry(state, accountId);
-  if (entry.status !== "awaiting-folder-review" || entry.reviewId !== reviewId) {
+  const resolved = resolveDriveLifecycleAccount(state, accountId);
+  const entry = resolved.entry ?? assertEntry(state, resolved.rawAccountId);
+  const rawAccountId = resolved.rawAccountId;
+  const rawReviewId = resolveInternalReviewId(entry, reviewId, resolved.usesPublicAlias);
+  const rawScope = resolveInternalScope(entry, scope, resolved.usesPublicAlias);
+  if (entry.status !== "awaiting-folder-review" || entry.reviewId !== rawReviewId) {
     throw new GoogleDriveLifecycleError("DRIVE_FOLDER_REVIEW_NOT_READY", "Continue the saved Drive folder review before approving file content.");
   }
   const bounded = new FolderBoundedDriveConnector(connector, entry.authorizedFolderIds);
@@ -560,28 +726,35 @@ export async function grantGoogleDriveFolderContent({
     stateStore,
     connector: bounded,
     source: SOURCE,
-    accountId,
-    reviewId,
-    scope,
+    accountId: rawAccountId,
+    reviewId: rawReviewId,
+    scope: rawScope,
     language,
     clock,
     grantIdFactory
   });
   const refreshed = await loadState(stateStore);
-  const refreshedEntry = assertEntry(refreshed, accountId);
+  const refreshedEntry = assertEntry(refreshed, rawAccountId);
   refreshedEntry.status = "ready-to-fetch";
-  refreshedEntry.audit.push({ type: "drive-folder-grant-saved", at: isoNow(clock), reviewId, grantId: granted.permissionReview.activeGrant?.grantId ?? null });
-  await stateStore.save(refreshed);
-  return { drive: publicView(refreshedEntry, languageFor(refreshed, language), granted.permissionReview) };
+  refreshedEntry.audit.push({ type: "drive-folder-grant-saved", at: isoNow(clock), reviewId: rawReviewId, grantId: granted.permissionReview.activeGrant?.grantId ?? null });
+  await saveDriveLifecycleState(stateStore, refreshed);
+  return {
+    drive: publicView(refreshedEntry, languageFor(refreshed, language), granted.permissionReview, {
+      exposeStableIdentifiers: resolved.usesPublicAlias
+    })
+  };
 }
 
 /** Fetches only approved opaque Drive references, enriching them with safe preflight metadata. */
-export async function fetchApprovedGoogleDriveContent({ message, stateStore, connector, accountId = "google-drive", reviewId, language, clock }) {
+export async function fetchApprovedGoogleDriveContent({ message, stateStore, connector, accountId, reviewId, language, clock }) {
   assertNaturalLanguage(message);
   assertConnector(connector);
   const state = await loadState(stateStore);
-  const entry = assertEntry(state, accountId);
-  if (entry.status !== "ready-to-fetch" || entry.reviewId !== reviewId) {
+  const resolved = resolveDriveLifecycleAccount(state, accountId);
+  const entry = resolved.entry ?? assertEntry(state, resolved.rawAccountId);
+  const rawAccountId = resolved.rawAccountId;
+  const rawReviewId = resolveInternalReviewId(entry, reviewId, resolved.usesPublicAlias);
+  if (entry.status !== "ready-to-fetch" || entry.reviewId !== rawReviewId) {
     throw new GoogleDriveLifecycleError("DRIVE_GRANT_REQUIRED", "No Drive file content was read because the saved selected-folder grant is not ready.");
   }
   const bounded = new FolderBoundedDriveConnector(connector, entry.authorizedFolderIds, {
@@ -591,13 +764,13 @@ export async function fetchApprovedGoogleDriveContent({ message, stateStore, con
   });
   let fetched;
   try {
-    fetched = await fetchApprovedSourceContent({ message, stateStore, connector: bounded, source: SOURCE, accountId, reviewId, language, clock });
+    fetched = await fetchApprovedSourceContent({ message, stateStore, connector: bounded, source: SOURCE, accountId: rawAccountId, reviewId: rawReviewId, language, clock });
   } catch (error) {
     if (!isRecoverableConnectorFailure(error)) throw error;
     const safeLanguage = languageFor(state, language);
-    const localRevocation = await revokeLocalDriveGrantAfterFailure({ stateStore, accountId, reviewId, language: safeLanguage, clock });
+    const localRevocation = await revokeLocalDriveGrantAfterFailure({ stateStore, accountId: rawAccountId, reviewId: rawReviewId, language: safeLanguage, clock });
     const failedState = await loadState(stateStore);
-    const failedEntry = assertEntry(failedState, accountId);
+    const failedEntry = assertEntry(failedState, rawAccountId);
     const status = fetchFailureStatus(error);
     failedEntry.status = status;
     failedEntry.authorization = {
@@ -616,64 +789,105 @@ export async function fetchApprovedGoogleDriveContent({ message, stateStore, con
       localGrantInvalidated: localRevocation !== null,
       bodyAccessState: "unconfirmed-after-connector-failure"
     });
-    await stateStore.save(failedState);
+    await saveDriveLifecycleState(stateStore, failedState);
     return {
-      drive: publicView(failedEntry, languageFor(failedState, language), localRevocation?.permissionReview),
+      drive: publicView(failedEntry, languageFor(failedState, language), localRevocation?.permissionReview, {
+        exposeStableIdentifiers: resolved.usesPublicAlias
+      }),
       importUnavailable: true,
       recoveryRequired: true
     };
   }
   const refreshed = await loadState(stateStore);
-  const refreshedEntry = assertEntry(refreshed, accountId);
+  const refreshedEntry = assertEntry(refreshed, rawAccountId);
   const normalizedSourceRecords = fetched.approvedRecords
     .map((record) => refreshedEntry.normalizedMetadataById[record.sourceRecordId])
     .filter(Boolean)
     .map((metadata) => ({ ...clone(metadata), processingDisposition: "untrusted-inert-reference" }));
   refreshedEntry.status = "imported";
-  refreshedEntry.audit.push({ type: "drive-approved-references-imported", at: isoNow(clock), reviewId, recordCount: normalizedSourceRecords.length });
-  await stateStore.save(refreshed);
+  refreshedEntry.audit.push({ type: "drive-approved-references-imported", at: isoNow(clock), reviewId: rawReviewId, recordCount: normalizedSourceRecords.length });
+  await saveDriveLifecycleState(stateStore, refreshed);
   return {
-    drive: publicView(refreshedEntry, languageFor(refreshed, language), fetched.permissionReview),
-    approvedRecords: fetched.approvedRecords,
-    normalizedSourceRecords
+    drive: publicView(refreshedEntry, languageFor(refreshed, language), fetched.permissionReview, {
+      exposeStableIdentifiers: resolved.usesPublicAlias
+    }),
+    approvedRecords: resolved.usesPublicAlias
+      ? projectApprovedReferencesWithStableAliases(
+        refreshedEntry,
+        ALIAS_NAMESPACE,
+        fetched.approvedRecords,
+        { removeStableLink: true }
+      )
+      : clone(fetched.approvedRecords),
+    normalizedSourceRecords: resolved.usesPublicAlias
+      ? projectApprovedReferencesWithStableAliases(
+        refreshedEntry,
+        ALIAS_NAMESPACE,
+        normalizedSourceRecords,
+        { removeStableLink: true }
+      )
+      : clone(normalizedSourceRecords)
   };
 }
 
 /** Revokes the local grant and asks the plugin to revoke its read-only authorization when supported. */
-export async function revokeGoogleDriveConnection({ message, stateStore, connector, plugin, accountId = "google-drive", reviewId, language, clock }) {
+export async function revokeGoogleDriveConnection({ message, stateStore, connector, plugin, accountId, reviewId, language, clock }) {
   assertNaturalLanguage(message);
   const state = await loadState(stateStore);
-  const entry = assertEntry(state, accountId);
-  let permissionReview = await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId, language });
+  const resolved = resolveDriveLifecycleAccount(state, accountId);
+  const entry = resolved.entry ?? assertEntry(state, resolved.rawAccountId);
+  const rawAccountId = resolved.rawAccountId;
+  const rawReviewId = resolveInternalReviewId(entry, reviewId, resolved.usesPublicAlias);
+  let permissionReview = await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId: rawAccountId, language });
   if (entry.reviewId && permissionReview?.permissionReview?.activeGrant) {
     assertConnector(connector);
     const bounded = new FolderBoundedDriveConnector(connector, entry.authorizedFolderIds);
-    permissionReview = await revokeSourcePermission({ message, stateStore, connector: bounded, source: SOURCE, accountId, reviewId, language, clock });
+    permissionReview = await revokeSourcePermission({ message, stateStore, connector: bounded, source: SOURCE, accountId: rawAccountId, reviewId: rawReviewId, language, clock });
   }
   const remoteAuthorizationWasGranted = ["authorized", "partial"].includes(entry.authorization.status);
   let pluginRevoked = false;
   if (plugin && typeof plugin.revokeFolderScopedReadOnly === "function") {
     try {
-      const result = await plugin.revokeFolderScopedReadOnly({ source: SOURCE, accountId });
+      const result = await plugin.revokeFolderScopedReadOnly({ source: SOURCE, accountId: rawAccountId });
       pluginRevoked = result?.status === "revoked";
     } catch {
       pluginRevoked = false;
     }
   }
   const refreshed = await loadState(stateStore);
-  const refreshedEntry = assertEntry(refreshed, accountId);
+  const refreshedEntry = assertEntry(refreshed, rawAccountId);
   refreshedEntry.status = pluginRevoked || !remoteAuthorizationWasGranted ? "revoked" : "revocation-unconfirmed";
   refreshedEntry.authorization.status = pluginRevoked ? "revoked" : refreshedEntry.authorization.status;
-  refreshedEntry.audit.push({ type: "drive-connection-revocation-requested", at: isoNow(clock), reviewId: reviewId ?? null, pluginRevoked });
-  await stateStore.save(refreshed);
-  return { drive: publicView(refreshedEntry, languageFor(refreshed, language), permissionReview?.permissionReview) };
+  refreshedEntry.audit.push({ type: "drive-connection-revocation-requested", at: isoNow(clock), reviewId: rawReviewId ?? null, pluginRevoked });
+  await saveDriveLifecycleState(stateStore, refreshed);
+  return {
+    drive: publicView(refreshedEntry, languageFor(refreshed, language), permissionReview?.permissionReview, {
+      exposeStableIdentifiers: resolved.usesPublicAlias
+    })
+  };
 }
 
 /** Read-only status lookup; never invokes a Drive plugin or connector. */
-export async function getGoogleDriveConnectionStatus({ stateStore, accountId = "google-drive", language }) {
+export async function getGoogleDriveConnectionStatus({ stateStore, accountId, language }) {
   const state = await loadState(stateStore);
-  const entry = lifecycle(state).entries[entryKey(accountId)];
+  const resolved = resolveDriveLifecycleAccount(state, accountId);
+  const entry = resolved.entry;
   if (!entry) return null;
-  const permission = await getSourcePermissionStatus({ stateStore, source: SOURCE, accountId, language });
-  return { drive: publicView(entry, languageFor(state, language), permission?.permissionReview) };
+  const permission = getSourcePermissionStatusFromState({
+    state,
+    source: SOURCE,
+    accountId: resolved.rawAccountId,
+    language
+  });
+  return {
+    drive: publicView(entry, languageFor(state, language), permission?.permissionReview, {
+      exposeStableIdentifiers: resolved.usesPublicAlias
+    }),
+    sourceStatus: getPersistedAdapterSourceStatus({
+      state,
+      adapter: SOURCE_ADAPTER_NAMES.GOOGLE_DRIVE,
+      accountId: resolved.accountAlias,
+      language: languageFor(state, language)
+    })
+  };
 }

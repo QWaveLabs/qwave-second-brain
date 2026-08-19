@@ -3,17 +3,58 @@
  * install Obsidian, or access customer sources.
  */
 
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { mkdir, open, readFile, rename, writeFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
+
+const FILE_STATE_STORE_AUTHORITIES = new WeakMap();
+
+/**
+ * Returns an immutable, module-owned view only for an exact FileStateStore.
+ * Wrappers, proxies, subclasses, and protocol-shaped objects cannot acquire
+ * this capability, even when they expose the same public methods.
+ */
+export function trustedFileStateStoreFacade(stateStore) {
+  return FILE_STATE_STORE_AUTHORITIES.get(stateStore) ?? null;
+}
 
 export class FileStateStore {
+  #filePath;
+
   constructor(filePath) {
-    this.filePath = filePath;
+    if (typeof filePath !== "string" || filePath.length === 0) {
+      throw new TypeError("FileStateStore requires a non-empty local file path string.");
+    }
+    // Snapshot one primitive absolute path before the store can become an
+    // authority. Later saves must never coerce a caller-owned object or move
+    // to a different file because the process working directory changed.
+    this.#filePath = resolve(filePath);
+    if (new.target === FileStateStore) {
+      const instance = this;
+      FILE_STATE_STORE_AUTHORITIES.set(this, Object.freeze({
+        get filePath() {
+          return instance.#filePath;
+        },
+        load() {
+          return instance.#load();
+        },
+        save(state) {
+          return instance.#save(state);
+        }
+      }));
+    }
+  }
+
+  get filePath() {
+    return this.#filePath;
   }
 
   async load() {
+    return this.#load();
+  }
+
+  async #load() {
     try {
-      return JSON.parse(await readFile(this.filePath, "utf8"));
+      return JSON.parse(await readFile(this.#filePath, "utf8"));
     } catch (error) {
       if (error?.code === "ENOENT") return null;
       throw error;
@@ -21,10 +62,18 @@ export class FileStateStore {
   }
 
   async save(state) {
-    await mkdir(dirname(this.filePath), { recursive: true });
-    const temporary = `${this.filePath}.tmp`;
+    return this.#save(state);
+  }
+
+  async #save(state) {
+    await mkdir(dirname(this.#filePath), { recursive: true });
+    const temporary = `${this.#filePath}.tmp`;
     await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, "utf8");
-    await rename(temporary, this.filePath);
+    const staged = await open(temporary, "r");
+    try { await staged.sync(); } finally { await staged.close(); }
+    await rename(temporary, this.#filePath);
+    const parent = await open(dirname(this.#filePath), "r");
+    try { await parent.sync(); } finally { await parent.close(); }
   }
 }
 

@@ -8,7 +8,10 @@
  * connector contract.
  */
 
-import { randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash, randomUUID } from "node:crypto";
+import { realpathSync } from "node:fs";
+import path from "node:path";
 
 export const PERMISSION_SOURCE_KINDS = Object.freeze({
   gmail: "communication",
@@ -58,6 +61,25 @@ export const SENSITIVE_CATEGORIES = Object.freeze([
 const STATE_KEY = "sourcePermissionLifecycle";
 const REVIEW_STATUSES = new Set(["awaiting-grant", "denied", "granted", "revoked"]);
 const ACCESS_LEVELS = new Set(["allowed", "restricted", "blocked"]);
+const METADATA_DIGEST = /^[a-f0-9]{64}$/;
+const WHATSAPP_ACCOUNT_REFERENCE = /^wa-account-[a-z0-9._:-]{1,128}$/;
+const WHATSAPP_PERSON_REFERENCE = /^wa-person-[a-f0-9]{20}$/;
+const WHATSAPP_CHAT_REFERENCE = /^wa-chat-[a-f0-9]{20}$/;
+const WHATSAPP_PERSON_LABEL = /^WhatsApp person [1-9]\d{0,3}$/;
+const WHATSAPP_CHAT_LABEL = /^(?:Direct|Group) WhatsApp chat [1-9]\d{0,3}$/;
+const WHATSAPP_ACCOUNT_LABEL = "Personal WhatsApp snapshot";
+// Every lifecycle writer persists the same Setup Session root object. A
+// source/account-scoped lock cannot protect that shared document: an unrelated
+// source could otherwise save an older root and resurrect a revoked grant.
+// FileStateStore instances can also be reconstructed with equivalent lexical
+// paths, so derive one in-process lock identity from the canonical backing
+// file. Public writers are deliberately not re-entrant: a connector or
+// state-store callback must never mutate the root and then let an outer stale
+// snapshot overwrite that mutation. Trusted connector lifecycles use the
+// explicit lock-held primitives below instead of re-entering a public writer.
+const stateStoreOperationTails = new Map();
+const inMemoryStateStoreOperationKeys = new WeakMap();
+const stateStoreLockContext = new AsyncLocalStorage();
 
 export class PermissionLifecycleError extends Error {
   constructor(code, customerMessage) {
@@ -77,6 +99,103 @@ function assertStateStore(stateStore) {
   if (!stateStore || typeof stateStore.load !== "function" || typeof stateStore.save !== "function") {
     throw new TypeError("A persistent stateStore with load() and save() is required.");
   }
+}
+
+function canonicalStateStorePath(filePath) {
+  const resolved = path.resolve(filePath);
+  try {
+    return typeof realpathSync.native === "function" ? realpathSync.native(resolved) : realpathSync(resolved);
+  } catch {
+    // The file itself is absent before bootstrap. Canonicalizing an existing
+    // parent still handles symlinked state directories; path.resolve handles
+    // lexical aliases such as ../ until that parent exists.
+    const parent = path.dirname(resolved);
+    try {
+      const canonicalParent = typeof realpathSync.native === "function"
+        ? realpathSync.native(parent)
+        : realpathSync(parent);
+      return path.join(canonicalParent, path.basename(resolved));
+    } catch {
+      return resolved;
+    }
+  }
+}
+
+function stateStoreOperationKey(stateStore) {
+  if (typeof stateStore?.filePath === "string" && stateStore.filePath) {
+    return `file:${canonicalStateStorePath(stateStore.filePath)}`;
+  }
+  let key = inMemoryStateStoreOperationKeys.get(stateStore);
+  if (!key) {
+    key = {};
+    inMemoryStateStoreOperationKeys.set(stateStore, key);
+  }
+  return key;
+}
+
+/**
+ * Serializes full read-modify-write lifecycle operations for one persisted
+ * Setup Session, including distinct FileStateStore instances for the same
+ * file. This is intentionally wider than a source or account: stateStore.save
+ * writes the entire root document, so any concurrent lifecycle writer could
+ * otherwise restore stale entries for a different source.
+ */
+async function withSourcePermissionStateLockMode(stateStore, operation, mode) {
+  assertStateStore(stateStore);
+  if (typeof operation !== "function") throw new TypeError("A state-store operation function is required.");
+  const key = stateStoreOperationKey(stateStore);
+  const inherited = stateStoreLockContext.getStore();
+  const inheritedMode = inherited?.modes?.get(key);
+  if (inheritedMode) {
+    if (mode === "read") return operation();
+    if (inheritedMode === "read") {
+      const upgradedModes = new Map(inherited.modes);
+      upgradedModes.set(key, "write");
+      return stateStoreLockContext.run({ modes: upgradedModes }, operation);
+    }
+    throw new PermissionLifecycleError(
+      "STATE_LOCK_REENTRANT_OPERATION_BLOCKED",
+      "I stopped a nested Setup Session change so an older saved state could not overwrite a newer permission decision. Retry that action after the current step finishes."
+    );
+  }
+
+  const previous = stateStoreOperationTails.get(key) ?? Promise.resolve();
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  stateStoreOperationTails.set(key, previous.catch(() => undefined).then(() => gate));
+  await previous.catch(() => undefined);
+  const modes = new Map(inherited?.modes ?? []);
+  modes.set(key, mode);
+  try {
+    return await stateStoreLockContext.run({ modes }, operation);
+  } finally {
+    release();
+  }
+}
+
+export async function withSourcePermissionStateLock(stateStore, operation) {
+  return withSourcePermissionStateLockMode(stateStore, operation, "write");
+}
+
+// Status views serialize with writers but never save their loaded snapshot.
+// A public writer invoked by a read-only callback may therefore run safely;
+// that nested writer is temporarily upgraded to write mode so any further
+// writer re-entry still fails closed.
+export async function withSourcePermissionStateReadLock(stateStore, operation) {
+  return withSourcePermissionStateLockMode(stateStore, operation, "read");
+}
+
+async function runWithinHeldSourcePermissionStateLock(stateStore, operation) {
+  assertStateStore(stateStore);
+  if (typeof operation !== "function") throw new TypeError("A state-store operation function is required.");
+  const key = stateStoreOperationKey(stateStore);
+  if (stateStoreLockContext.getStore()?.modes?.get(key) !== "write") {
+    throw new PermissionLifecycleError(
+      "STATE_LOCK_REQUIRED",
+      "I stopped an internal Setup Session change because its full-state lock was not active. Retry from the guided source flow."
+    );
+  }
+  return operation();
 }
 
 function assertConnector(connector) {
@@ -119,6 +238,43 @@ function sourceKind(source) {
     );
   }
   return kind;
+}
+
+// Slack has a connector-specific boundary for independently enforceable
+// channel, DM, group, people, pagination, and stable-reference rules. The
+// generic lifecycle remains public for the other source kinds, but it must
+// never become an alternate public path around that Slack boundary.
+function assertPublicLifecycleSource(source) {
+  if (source === "slack") {
+    throw new PermissionLifecycleError(
+      "SLACK_SPECIALIZED_LIFECYCLE_REQUIRED",
+      "Slack uses its dedicated read-only review flow so its channel, direct-message, group, people, and pagination boundaries stay enforceable. Start the Slack connection from that guided flow."
+    );
+  }
+  if (source === "whatsapp") {
+    throw new PermissionLifecycleError(
+      "WHATSAPP_SPECIALIZED_LIFECYCLE_REQUIRED",
+      "WhatsApp snapshot permission is available only through its private local snapshot flow, so its manifest, local-alias, media, and bounded-fetch safeguards stay enforceable. Start the WhatsApp connection from that guided flow."
+    );
+  }
+}
+
+function assertSpecializedSlackSource(source) {
+  if (source !== "slack") {
+    throw new PermissionLifecycleError(
+      "SPECIALIZED_SOURCE_MISMATCH",
+      "This specialized permission bridge is reserved for the Slack lifecycle."
+    );
+  }
+}
+
+function assertSpecializedWhatsAppSource(source) {
+  if (source !== "whatsapp") {
+    throw new PermissionLifecycleError(
+      "SPECIALIZED_SOURCE_MISMATCH",
+      "This specialized permission bridge is reserved for the private WhatsApp snapshot lifecycle."
+    );
+  }
 }
 
 function sourceKey(source, accountId) {
@@ -176,6 +332,36 @@ function redactUntrustedLabel(value) {
   return withoutTokens.slice(0, 160);
 }
 
+function normalizedMetadataTimestamp(value) {
+  if (typeof value !== "string" || !value.trim() || !Number.isFinite(Date.parse(value))) return null;
+  return new Date(value).toISOString();
+}
+
+function safeMetadataLink(value) {
+  if (typeof value !== "string" || !value.trim()) return null;
+  try {
+    const url = new URL(value);
+    if (
+      url.protocol !== "https:"
+      || url.username
+      || url.password
+      || url.port
+      || url.hostname === "localhost"
+      || url.hostname.endsWith(".localhost")
+      || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(url.hostname)
+      || url.hostname.includes(":")
+    ) return null;
+    const stable = `${url.origin}${url.pathname}`;
+    if (
+      stable.length > 512
+      || /(?:\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b|\b(?:\d[ -]?){9,}\b|\b(?:api[ _-]?key|password|passcode|secret|access[ _-]?token|bearer)\b)/i.test(decodeURIComponent(url.pathname))
+    ) return null;
+    return stable;
+  } catch {
+    return null;
+  }
+}
+
 function uniqueStrings(values) {
   return [...new Set((Array.isArray(values) ? values : [])
     .filter((value) => typeof value === "string" && value.trim())
@@ -183,7 +369,27 @@ function uniqueStrings(values) {
 }
 
 function normalizedAccessLevel(value) {
-  return ACCESS_LEVELS.has(value) ? value : "allowed";
+  return ACCESS_LEVELS.has(value) ? value : "restricted";
+}
+
+function normalizedSensitiveCategories(item) {
+  const declared = item?.sensitiveCategories == null
+    ? []
+    : Array.isArray(item.sensitiveCategories)
+      ? item.sensitiveCategories
+      : [item.sensitiveCategories];
+  const recognized = uniqueStrings(declared).filter((category) => SENSITIVE_CATEGORIES.includes(category));
+  const hasUnknownCategory = declared.some((category) => (
+    typeof category !== "string"
+    || !category.trim()
+    || !SENSITIVE_CATEGORIES.includes(category.trim())
+  ));
+  const hasMalformedUncertaintyMarker = item?.uncertainSensitivity !== undefined
+    && typeof item.uncertainSensitivity !== "boolean";
+  return uniqueStrings([
+    ...recognized,
+    ...(item?.uncertainSensitivity === true || hasUnknownCategory || hasMalformedUncertaintyMarker ? ["uncertain-sensitivity"] : [])
+  ]);
 }
 
 function normalizeMetadata(preflight, source) {
@@ -220,6 +426,18 @@ function normalizeMetadata(preflight, source) {
     if (!item || typeof item.id !== "string" || !item.id.trim()) {
       throw new PermissionLifecycleError("METADATA_PREFLIGHT_INVALID", "I could not safely identify one of the reviewed source items, so I stopped before requesting content access.");
     }
+    if (
+      item.participantIds != null
+      && (
+        !Array.isArray(item.participantIds)
+        || item.participantIds.some((id) => typeof id !== "string" || !id.trim())
+      )
+    ) {
+      throw new PermissionLifecycleError(
+        "METADATA_PARTICIPANT_BOUNDARY_INVALID",
+        "The metadata did not safely describe record participants, so I stopped before requesting content access."
+      );
+    }
     return {
       id: item.id.trim(),
       kind: item.kind === "conversation" ? "conversation" : "item",
@@ -228,13 +446,12 @@ function normalizeMetadata(preflight, source) {
       channel: typeof item.channel === "string" ? item.channel : null,
       conversation: typeof item.conversation === "string" ? item.conversation : null,
       category: typeof item.category === "string" ? item.category : "general",
-      sensitiveCategories: uniqueStrings([
-        ...item.sensitiveCategories ?? [],
-        ...(item.uncertainSensitivity === true ? ["uncertain-sensitivity"] : [])
-      ]).filter((category) => SENSITIVE_CATEGORIES.includes(category)),
+      timestamp: normalizedMetadataTimestamp(item.timestamp),
+      sensitiveCategories: normalizedSensitiveCategories(item),
       isGroup: item.isGroup === true,
-      participantIds: uniqueStrings(item.participantIds),
-      label: redactUntrustedLabel(item.label ?? item.title)
+      participantIds: item.participantIds == null ? [] : uniqueStrings(item.participantIds),
+      label: redactUntrustedLabel(item.label ?? item.title),
+      stableLink: safeMetadataLink(item.stableLink ?? item.webUrl ?? item.url)
     };
   });
   if (new Set(people.map((person) => person.id)).size !== people.length || new Set(items.map((item) => item.id)).size !== items.length) {
@@ -274,6 +491,76 @@ function normalizeMetadata(preflight, source) {
     blockedGroupConversations,
     itemCount: items.length
   };
+}
+
+function sourcePermissionMetadataDigest(metadata) {
+  return createHash("sha256").update(JSON.stringify(metadata)).digest("hex");
+}
+
+function assertReviewMetadataIntegrity(review) {
+  const metadata = review?.metadata;
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+    throw new PermissionLifecycleError(
+      "PERSISTED_METADATA_INVALID",
+      "The saved metadata review is incomplete, so no source content was read. Start a new metadata-only review."
+    );
+  }
+  const people = Array.isArray(metadata.people) ? metadata.people : [];
+  const items = Array.isArray(metadata.items) ? metadata.items : [];
+  const peopleById = new Map(people.map((person) => [person?.id, person]));
+  const expectedUnknownParticipantIds = uniqueStrings(items
+    .flatMap((item) => Array.isArray(item?.participantIds) ? item.participantIds : [])
+    .filter((id) => !peopleById.has(id)));
+  const expectedBlockedGroupConversations = items
+    .filter((item) => item?.kind === "conversation"
+      && item.isGroup === true
+      && Array.isArray(item.participantIds)
+      && item.participantIds.some((id) => peopleById.get(id)?.accessLevel === "blocked"))
+    .map((item) => ({ id: item.id, label: item.label }));
+  const expectedSensitiveGroups = SENSITIVE_CATEGORIES
+    .map((category) => {
+      const matching = items.filter((item) => Array.isArray(item?.sensitiveCategories) && item.sensitiveCategories.includes(category));
+      return matching.length === 0 ? null : {
+        category,
+        count: matching.length,
+        itemLabels: matching.map((item) => item.label)
+      };
+    })
+    .filter(Boolean);
+  const malformedPeople = people.some((person) => (
+    !person
+    || typeof person.id !== "string"
+    || !person.id.trim()
+    || !ACCESS_LEVELS.has(person.accessLevel)
+  ));
+  const malformedItems = items.some((item) => (
+    !item
+    || typeof item.id !== "string"
+    || !item.id.trim()
+    || !Array.isArray(item.participantIds)
+    || item.participantIds.some((id) => typeof id !== "string" || !id.trim())
+    || !Array.isArray(item.sensitiveCategories)
+    || item.sensitiveCategories.some((category) => !SENSITIVE_CATEGORIES.includes(category))
+  ));
+  const digest = sourcePermissionMetadataDigest(metadata);
+  if (
+    malformedPeople
+    || malformedItems
+    || new Set(people.map((person) => person.id)).size !== people.length
+    || new Set(items.map((item) => item.id)).size !== items.length
+    || metadata.itemCount !== items.length
+    || JSON.stringify(metadata.unknownParticipantIds) !== JSON.stringify(expectedUnknownParticipantIds)
+    || JSON.stringify(metadata.blockedGroupConversations) !== JSON.stringify(expectedBlockedGroupConversations)
+    || JSON.stringify(metadata.sensitiveGroups) !== JSON.stringify(expectedSensitiveGroups)
+    || !METADATA_DIGEST.test(review.metadataDigest ?? "")
+    || review.metadataDigest !== digest
+  ) {
+    throw new PermissionLifecycleError(
+      "PERSISTED_METADATA_INVALID",
+      "The saved metadata review no longer matches its integrity-bound snapshot, so no source content was read. Start a new metadata-only review."
+    );
+  }
+  return digest;
 }
 
 function dateRangeFor(kind, now) {
@@ -451,12 +738,29 @@ function normalizedScope(inputScope, review, kind, now) {
       throw new PermissionLifecycleError("PERSON_POLICY_CANNOT_BE_BROADENED", "A Blocked person remains blocked unless you begin a separate, explicit review.");
     }
   }
+  for (const personId of blockedPeople) {
+    if (peopleById.get(personId)?.accessLevel !== "blocked") {
+      throw new PermissionLifecycleError("PERSON_POLICY_CANNOT_BE_BROADENED", "Only a person reviewed as Blocked can enter a blocked-group exception boundary.");
+    }
+  }
+  const selectedPeople = [allowedPeople, restrictedPeople, blockedPeople];
+  if (new Set(selectedPeople.flat()).size !== selectedPeople.flat().length) {
+    throw new PermissionLifecycleError(
+      "PERSON_POLICY_OVERLAP",
+      "Each reviewed person must remain in one privacy classification; overlapping classifications cannot be approved."
+    );
+  }
 
   const sensitiveAllowed = metadata.sensitiveGroups.map((group) => group.category);
   const includedSensitive = assertSubset(requested.sensitiveGroups?.included, sensitiveAllowed, "sensitive categories");
   const excludedSensitive = assertSubset(requested.sensitiveGroups?.excluded, sensitiveAllowed, "sensitive categories");
   const effectiveIncludedSensitive = includedSensitive.filter((category) => !excludedSensitive.includes(category));
-  const selectedCategories = assertSubset(requested.categories, metadata.categories, "categories");
+  // A persisted canonical scope includes every explicitly approved sensitive
+  // group in `categories` as well as in `sensitiveGroups.included`. Accept
+  // only those explicitly included groups here so integrity revalidation is
+  // idempotent without letting a caller smuggle a sensitive category through
+  // the ordinary category list.
+  const selectedCategories = assertSubset(requested.categories, [...metadata.categories, ...includedSensitive], "categories");
   const finalCategories = applyExclusions(
     [...new Set([...selectedCategories, ...effectiveIncludedSensitive])],
     [...uniqueStrings(requested.exclusions?.categories), ...excludedSensitive]
@@ -470,6 +774,12 @@ function normalizedScope(inputScope, review, kind, now) {
   const finalConversations = applyExclusions(selectedConversations, explicitConversationExclusions)
     .filter((conversationId) => !allowedBlockedGroupIds.includes(conversationId) || exceptions.includes(conversationId));
 
+  // `people.allowed` is an allowlist, not merely a display preference.  An
+  // omitted Allowed person must be excluded before a connector receives the
+  // grant; otherwise a caller could appear to narrow people while still
+  // receiving every Allowed participant's records.
+  const finalAllowedPeople = applyExclusions(allowedPeople, exclusions.people);
+
   const scope = {
     accountId: metadata.account.id,
     areas: applyExclusions(assertSubset(requested.areas, metadata.areas, "areas"), exclusions.areas),
@@ -478,7 +788,7 @@ function normalizedScope(inputScope, review, kind, now) {
     conversations: finalConversations,
     categories: finalCategories,
     people: {
-      allowed: applyExclusions(allowedPeople, exclusions.people),
+      allowed: finalAllowedPeople,
       // These two lists are persisted as privacy boundaries, never content allowlists.
       restricted: uniqueStrings([...restrictedPeople, ...metadata.people.filter((person) => person.accessLevel === "restricted").map((person) => person.id)]),
       blocked: uniqueStrings([...blockedPeople, ...metadata.people.filter((person) => person.accessLevel === "blocked").map((person) => person.id)])
@@ -488,7 +798,14 @@ function normalizedScope(inputScope, review, kind, now) {
       areas: uniqueStrings(exclusions.areas),
       folders: uniqueStrings(exclusions.folders),
       channels: uniqueStrings(exclusions.channels),
-      people: uniqueStrings([...exclusions.people ?? [], ...requested.people?.restricted ?? [], ...requested.people?.blocked ?? [], ...metadata.people.filter((person) => person.accessLevel !== "allowed").map((person) => person.id), ...metadata.unknownParticipantIds]),
+      people: uniqueStrings([
+        ...exclusions.people ?? [],
+        ...allPeople.filter((personId) => !finalAllowedPeople.includes(personId)),
+        ...requested.people?.restricted ?? [],
+        ...requested.people?.blocked ?? [],
+        ...metadata.people.filter((person) => person.accessLevel !== "allowed").map((person) => person.id),
+        ...metadata.unknownParticipantIds
+      ]),
       conversations: uniqueStrings([...explicitConversationExclusions, ...allowedBlockedGroupIds.filter((id) => !exceptions.includes(id))]),
       categories: uniqueStrings([...exclusions.categories ?? [], ...excludedSensitive]),
       dateRanges: []
@@ -581,11 +898,176 @@ function publicReview(entry, language) {
   };
 }
 
-function assertPersistedGrantStillMatchesReview(grant, entry, clock) {
+function sameStringList(left, right) {
+  return Array.isArray(left)
+    && Array.isArray(right)
+    && left.length === right.length
+    && left.every((value, index) => value === right[index]);
+}
+
+function invalidSpecializedWhatsAppMetadata() {
+  throw new PermissionLifecycleError(
+    "PERSISTED_METADATA_INVALID",
+    "The saved WhatsApp metadata review no longer preserves its private alias boundary, so no source content was read. Start a new metadata-only review."
+  );
+}
+
+/**
+ * WhatsApp's local connector intentionally persists opaque aliases so the
+ * specialized guided flow can let a person choose a chat without ever seeing
+ * its original account, contact, chat, or path details. Generic public
+ * reviews deliberately omit people and reviewed items for sources such as
+ * Slack; expose those fields here only after proving every value remains a
+ * local WhatsApp alias and generic label.
+ */
+function specializedWhatsAppPublicMetadata(review) {
+  assertReviewMetadataIntegrity(review);
+  const metadata = review?.metadata;
+  if (
+    review?.source !== "whatsapp"
+    || metadata?.source !== "whatsapp"
+    || !WHATSAPP_ACCOUNT_REFERENCE.test(metadata?.account?.id ?? "")
+    || metadata.account.label !== WHATSAPP_ACCOUNT_LABEL
+    || !Array.isArray(metadata.people)
+    || !Array.isArray(metadata.items)
+  ) {
+    invalidSpecializedWhatsAppMetadata();
+  }
+
+  const people = metadata.people.map((person) => ({
+    id: person.id,
+    label: person.label,
+    accessLevel: person.accessLevel
+  }));
+  if (
+    people.some((person) => (
+      !WHATSAPP_PERSON_REFERENCE.test(person.id)
+      || !WHATSAPP_PERSON_LABEL.test(person.label)
+      || !ACCESS_LEVELS.has(person.accessLevel)
+    ))
+    || new Set(people.map((person) => person.id)).size !== people.length
+  ) {
+    invalidSpecializedWhatsAppMetadata();
+  }
+
+  const knownPersonIds = new Set(people.map((person) => person.id));
+  const reviewedItems = metadata.items.map((item) => ({
+    id: item.id,
+    kind: item.kind,
+    conversation: item.conversation,
+    category: item.category,
+    sensitiveCategories: [...item.sensitiveCategories],
+    isGroup: item.isGroup,
+    participantIds: [...item.participantIds],
+    label: item.label
+  }));
+  const malformedItem = metadata.items.some((item, index) => {
+    const projected = reviewedItems[index];
+    const expectedSensitiveCategories = item.category === "messages" ? [] : [item.category];
+    const isKnownCategory = item.category === "messages" || SENSITIVE_CATEGORIES.includes(item.category);
+    const hasSafeParticipants = projected.participantIds.length > 0
+      && new Set(projected.participantIds).size === projected.participantIds.length
+      && projected.participantIds.every((id) => knownPersonIds.has(id));
+    return (
+      !WHATSAPP_CHAT_REFERENCE.test(projected.id)
+      || projected.kind !== "conversation"
+      || projected.conversation !== projected.id
+      || !isKnownCategory
+      || !sameStringList(projected.sensitiveCategories, expectedSensitiveCategories)
+      || typeof projected.isGroup !== "boolean"
+      || !hasSafeParticipants
+      || !WHATSAPP_CHAT_LABEL.test(projected.label)
+      || (projected.isGroup ? !projected.label.startsWith("Group WhatsApp chat ") : !projected.label.startsWith("Direct WhatsApp chat "))
+      || item.area !== null
+      || item.folder !== null
+      || item.channel !== null
+      || item.timestamp !== null
+      || item.stableLink !== null
+    );
+  });
+  if (malformedItem || new Set(reviewedItems.map((item) => item.id)).size !== reviewedItems.length) {
+    invalidSpecializedWhatsAppMetadata();
+  }
+
+  const expectedConversations = uniqueStrings(reviewedItems.map((item) => item.id));
+  const expectedCategories = uniqueStrings(reviewedItems.map((item) => item.category));
+  if (
+    !sameStringList(metadata.areas, [])
+    || !sameStringList(metadata.folders, [])
+    || !sameStringList(metadata.channels, [])
+    || !sameStringList(metadata.conversations, expectedConversations)
+    || !sameStringList(metadata.categories, expectedCategories)
+    || !sameStringList(metadata.unknownParticipantIds, [])
+    || metadata.itemCount !== reviewedItems.length
+  ) {
+    invalidSpecializedWhatsAppMetadata();
+  }
+
+  const peopleById = new Map(people.map((person) => [person.id, person]));
+  const blockedGroupConversations = reviewedItems
+    .filter((item) => item.isGroup && item.participantIds.some((id) => peopleById.get(id)?.accessLevel === "blocked"))
+    .map((item) => ({ id: item.id, label: item.label }));
+  const sensitiveGroups = SENSITIVE_CATEGORIES
+    .map((category) => {
+      const matching = reviewedItems.filter((item) => item.sensitiveCategories.includes(category));
+      return matching.length === 0 ? null : {
+        category,
+        count: matching.length,
+        itemLabels: matching.map((item) => item.label)
+      };
+    })
+    .filter(Boolean);
+
+  return {
+    account: { id: metadata.account.id, label: metadata.account.label },
+    people,
+    reviewedItems,
+    sensitiveGroups,
+    blockedGroupConversations
+  };
+}
+
+function specializedWhatsAppPublicReview(entry, language) {
+  const projection = specializedWhatsAppPublicMetadata(entry.review);
+  const generic = publicReview(entry, language);
+  return {
+    ...generic,
+    account: clone(projection.account),
+    metadataPreflight: {
+      ...generic.metadataPreflight,
+      itemCount: projection.reviewedItems.length,
+      sensitiveGroups: clone(projection.sensitiveGroups),
+      blockedGroupConversations: clone(projection.blockedGroupConversations),
+      people: clone(projection.people),
+      reviewedItems: clone(projection.reviewedItems)
+    },
+    permissionRequest: {
+      ...generic.permissionRequest,
+      account: clone(projection.account)
+    }
+  };
+}
+
+export function assertPersistedSourcePermissionGrantStillMatchesReview(grant, entry, clock) {
   if (!grant?.disclosuresAcknowledged?.modelProcessing?.acknowledged || !grant?.disclosuresAcknowledged?.untrustedSourceMaterial?.acknowledged) {
     throw new PermissionLifecycleError(
       "PERSISTED_GRANT_INVALID",
       "The saved permission no longer includes the required privacy acknowledgements, so no source content was read. Start a new review."
+    );
+  }
+  let metadataDigest;
+  try {
+    metadataDigest = assertReviewMetadataIntegrity(entry?.review);
+  } catch {
+    throw new PermissionLifecycleError(
+      "PERSISTED_GRANT_INVALID",
+      "The saved permission no longer matches its integrity-bound metadata review, so no source content was read. Start a new review."
+    );
+  }
+  if (grant?.metadataDigest !== metadataDigest) {
+    throw new PermissionLifecycleError(
+      "PERSISTED_GRANT_INVALID",
+      "The saved permission was not bound to this metadata review, so no source content was read. Start a new review."
     );
   }
   let canonicalScope;
@@ -605,6 +1087,24 @@ function assertPersistedGrantStillMatchesReview(grant, entry, clock) {
   }
 }
 
+// Deliberately not re-exported from src/index.mjs. The specialized WhatsApp
+// lifecycle uses this digest comparison while it already holds the shared
+// state lock, so it can verify a fresh local manifest against the persisted
+// metadata snapshot without exposing people or item aliases through a generic
+// public permission view.
+export function specializedWhatsAppMetadataMatchesPermissionReview({ state, source, accountId, metadata }) {
+  assertSpecializedWhatsAppSource(source);
+  const entry = state?.[STATE_KEY]?.entries?.[sourceKey(source, accountId)];
+  if (!entry || entry.review?.source !== source || entry.review?.metadata?.account?.id !== accountId) return false;
+  try {
+    const persistedDigest = assertReviewMetadataIntegrity(entry.review);
+    const candidate = normalizeMetadata(metadata, source);
+    return candidate.account.id === accountId && sourcePermissionMetadataDigest(candidate) === persistedDigest;
+  } catch {
+    return false;
+  }
+}
+
 async function loadRootState(stateStore) {
   const state = await stateStore.load();
   if (!state) {
@@ -621,14 +1121,15 @@ async function loadRootState(stateStore) {
  * granular permission request. This is the only entry point that starts a
  * source review; connector discovery is never a body fetch.
  */
-export async function beginSourcePermissionReview({
+async function beginSourcePermissionReviewInternal({
   message,
   stateStore,
   connector,
   source,
   language,
   clock,
-  reviewIdFactory
+  reviewIdFactory,
+  permissionReviewRenderer = publicReview
 }) {
   assertNaturalLanguage(message, "start");
   assertStateStore(stateStore);
@@ -640,7 +1141,7 @@ export async function beginSourcePermissionReview({
   const key = sourceKey(source, metadata.account.id);
   const previousEntry = lifecycle.entries[key];
   if (previousEntry?.status === "granted") {
-    return { permissionReview: publicReview(previousEntry, languageFor(state, language)) };
+    return { permissionReview: permissionReviewRenderer(previousEntry, languageFor(state, language)) };
   }
   const now = isoNow(clock);
   const reviewId = (reviewIdFactory ?? defaultReviewId)();
@@ -653,6 +1154,7 @@ export async function beginSourcePermissionReview({
       id: reviewId,
       source,
       metadata,
+      metadataDigest: sourcePermissionMetadataDigest(metadata),
       requestedScope: defaultScope(metadata, kind, now),
       createdAt: now
     },
@@ -666,7 +1168,33 @@ export async function beginSourcePermissionReview({
   lifecycle.entries[key] = entry;
   pushAudit(lifecycle, { type: "metadata-preflight", at: now, source, accountId: metadata.account.id, reviewId, contentBodiesRead: false });
   await stateStore.save(state);
-  return { permissionReview: publicReview(entry, languageFor(state, language)) };
+  return { permissionReview: permissionReviewRenderer(entry, languageFor(state, language)) };
+}
+
+export async function beginSourcePermissionReview(args) {
+  assertPublicLifecycleSource(args?.source);
+  return withSourcePermissionStateLock(args?.stateStore, () => beginSourcePermissionReviewInternal({ ...args, permissionReviewRenderer: publicReview }));
+}
+
+export async function beginSourcePermissionReviewWithinStateLock(args) {
+  assertPublicLifecycleSource(args?.source);
+  return runWithinHeldSourcePermissionStateLock(args?.stateStore, () => beginSourcePermissionReviewInternal({ ...args, permissionReviewRenderer: publicReview }));
+}
+
+// Deliberately not re-exported from src/index.mjs. The Slack connector owns
+// the public customer flow and invokes this shared persistence primitive only
+// after applying its additional source-specific safeguards.
+export async function beginSpecializedSourcePermissionReview(args) {
+  assertSpecializedSlackSource(args?.source);
+  return runWithinHeldSourcePermissionStateLock(args?.stateStore, () => beginSourcePermissionReviewInternal({ ...args, permissionReviewRenderer: publicReview }));
+}
+
+// Deliberately not re-exported from src/index.mjs. The private WhatsApp
+// snapshot lifecycle owns this bridge and may call it only while it holds the
+// shared in-process state lock.
+export async function beginSpecializedWhatsAppPermissionReview(args) {
+  assertSpecializedWhatsAppSource(args?.source);
+  return runWithinHeldSourcePermissionStateLock(args?.stateStore, () => beginSourcePermissionReviewInternal({ ...args, permissionReviewRenderer: specializedWhatsAppPublicReview }));
 }
 
 /**
@@ -674,7 +1202,7 @@ export async function beginSourcePermissionReview({
  * review cannot be used after denial or revocation, and a second matching call
  * returns the existing grant rather than widening or duplicating access.
  */
-export async function grantSourcePermission({
+async function grantSourcePermissionInternal({
   message,
   stateStore,
   connector,
@@ -684,7 +1212,8 @@ export async function grantSourcePermission({
   scope,
   language,
   clock,
-  grantIdFactory
+  grantIdFactory,
+  permissionReviewRenderer = publicReview
 }) {
   assertNaturalLanguage(message, "grant");
   assertStateStore(stateStore);
@@ -705,13 +1234,14 @@ export async function grantSourcePermission({
   }
 
   const now = isoNow(clock);
+  const metadataDigest = assertReviewMetadataIntegrity(entry.review);
   const normalized = normalizedScope(scope, entry.review, entry.sourceKind, now);
   const existing = entry.grants.find((grant) => grant.status === "active");
   if (existing) {
     if (JSON.stringify(existing.scope) !== JSON.stringify(normalized)) {
       throw new PermissionLifecycleError("SCOPE_CHANGE_REQUIRES_NEW_REVIEW", "This would change an approved scope. Start a new review so the change is visible before access is granted.");
     }
-    return { permissionReview: publicReview(entry, languageFor(state, language)) };
+    return { permissionReview: permissionReviewRenderer(entry, languageFor(state, language)) };
   }
 
   const wording = copy(languageFor(state, language));
@@ -720,6 +1250,7 @@ export async function grantSourcePermission({
     reviewId,
     source,
     accountId,
+    metadataDigest,
     status: "active",
     approvedAt: now,
     scope: normalized,
@@ -741,11 +1272,31 @@ export async function grantSourcePermission({
   entry.audit.push({ type: "permission-granted", at: now, reviewId, grantId: grant.id, scope: clone(normalized) });
   pushAudit(lifecycle, { type: "permission-granted", at: now, source, accountId, reviewId, grantId: grant.id });
   await stateStore.save(state);
-  return { permissionReview: publicReview(entry, languageFor(state, language)) };
+  return { permissionReview: permissionReviewRenderer(entry, languageFor(state, language)) };
+}
+
+export async function grantSourcePermission(args) {
+  assertPublicLifecycleSource(args?.source);
+  return withSourcePermissionStateLock(args?.stateStore, () => grantSourcePermissionInternal({ ...args, permissionReviewRenderer: publicReview }));
+}
+
+export async function grantSourcePermissionWithinStateLock(args) {
+  assertPublicLifecycleSource(args?.source);
+  return runWithinHeldSourcePermissionStateLock(args?.stateStore, () => grantSourcePermissionInternal({ ...args, permissionReviewRenderer: publicReview }));
+}
+
+export async function grantSpecializedSourcePermission(args) {
+  assertSpecializedSlackSource(args?.source);
+  return runWithinHeldSourcePermissionStateLock(args?.stateStore, () => grantSourcePermissionInternal({ ...args, permissionReviewRenderer: publicReview }));
+}
+
+export async function grantSpecializedWhatsAppPermission(args) {
+  assertSpecializedWhatsAppSource(args?.source);
+  return runWithinHeldSourcePermissionStateLock(args?.stateStore, () => grantSourcePermissionInternal({ ...args, permissionReviewRenderer: specializedWhatsAppPublicReview }));
 }
 
 /** Records an explicit denial without treating it as an error or allowing stale approval UI to revive it. */
-export async function denySourcePermission({ message, stateStore, source, accountId, reviewId, language, clock }) {
+async function denySourcePermissionInternal({ message, stateStore, source, accountId, reviewId, language, clock, permissionReviewRenderer = publicReview }) {
   assertNaturalLanguage(message, "deny");
   assertStateStore(stateStore);
   const state = await loadRootState(stateStore);
@@ -763,13 +1314,33 @@ export async function denySourcePermission({ message, stateStore, source, accoun
   pushAudit(lifecycle, { type: "permission-denied", at: now, source, accountId, reviewId, contentBodiesRead: false });
   await stateStore.save(state);
   return {
-    permissionReview: publicReview(entry, languageFor(state, language)),
+    permissionReview: permissionReviewRenderer(entry, languageFor(state, language)),
     message: copy(languageFor(state, language)).denied
   };
 }
 
+export async function denySourcePermission(args) {
+  assertPublicLifecycleSource(args?.source);
+  return withSourcePermissionStateLock(args?.stateStore, () => denySourcePermissionInternal({ ...args, permissionReviewRenderer: publicReview }));
+}
+
+export async function denySourcePermissionWithinStateLock(args) {
+  assertPublicLifecycleSource(args?.source);
+  return runWithinHeldSourcePermissionStateLock(args?.stateStore, () => denySourcePermissionInternal({ ...args, permissionReviewRenderer: publicReview }));
+}
+
+export async function denySpecializedSourcePermission(args) {
+  assertSpecializedSlackSource(args?.source);
+  return runWithinHeldSourcePermissionStateLock(args?.stateStore, () => denySourcePermissionInternal({ ...args, permissionReviewRenderer: publicReview }));
+}
+
+export async function denySpecializedWhatsAppPermission(args) {
+  assertSpecializedWhatsAppSource(args?.source);
+  return runWithinHeldSourcePermissionStateLock(args?.stateStore, () => denySourcePermissionInternal({ ...args, permissionReviewRenderer: specializedWhatsAppPublicReview }));
+}
+
 /** Revokes local permission state only; it never writes to a connected source application. */
-export async function revokeSourcePermission({ message, stateStore, connector, source, accountId, reviewId, language, clock }) {
+async function revokeSourcePermissionInternal({ message, stateStore, connector, source, accountId, reviewId, language, clock, permissionReviewRenderer = publicReview }) {
   assertNaturalLanguage(message, "revoke");
   assertStateStore(stateStore);
   if (!connector || typeof connector.revokePermissionGrant !== "function") {
@@ -801,9 +1372,29 @@ export async function revokeSourcePermission({ message, stateStore, connector, s
   pushAudit(lifecycle, { type: "permission-revoked", at: now, source, accountId, reviewId, grantId: activeGrant.id });
   await stateStore.save(state);
   return {
-    permissionReview: publicReview(entry, languageFor(state, language)),
+    permissionReview: permissionReviewRenderer(entry, languageFor(state, language)),
     message: copy(languageFor(state, language)).revoked
   };
+}
+
+export async function revokeSourcePermission(args) {
+  assertPublicLifecycleSource(args?.source);
+  return withSourcePermissionStateLock(args?.stateStore, () => revokeSourcePermissionInternal({ ...args, permissionReviewRenderer: publicReview }));
+}
+
+export async function revokeSourcePermissionWithinStateLock(args) {
+  assertPublicLifecycleSource(args?.source);
+  return runWithinHeldSourcePermissionStateLock(args?.stateStore, () => revokeSourcePermissionInternal({ ...args, permissionReviewRenderer: publicReview }));
+}
+
+export async function revokeSpecializedSourcePermission(args) {
+  assertSpecializedSlackSource(args?.source);
+  return runWithinHeldSourcePermissionStateLock(args?.stateStore, () => revokeSourcePermissionInternal({ ...args, permissionReviewRenderer: publicReview }));
+}
+
+export async function revokeSpecializedWhatsAppPermission(args) {
+  assertSpecializedWhatsAppSource(args?.source);
+  return runWithinHeldSourcePermissionStateLock(args?.stateStore, () => revokeSourcePermissionInternal({ ...args, permissionReviewRenderer: specializedWhatsAppPublicReview }));
 }
 
 /**
@@ -811,7 +1402,7 @@ export async function revokeSourcePermission({ message, stateStore, connector, s
  * only a durable active grant to the adapter and returns opaque source refs;
  * it never returns raw source bodies to the conversation, proof, or tests.
  */
-export async function fetchApprovedSourceContent({ message, stateStore, connector, source, accountId, reviewId, language, clock }) {
+async function fetchApprovedSourceContentInternal({ message, stateStore, connector, source, accountId, reviewId, language, clock, permissionReviewRenderer = publicReview }) {
   assertNaturalLanguage(message, "fetch");
   assertStateStore(stateStore);
   assertConnector(connector);
@@ -825,7 +1416,7 @@ export async function fetchApprovedSourceContent({ message, stateStore, connecto
   if (!grant || entry.status !== "granted") {
     throw new PermissionLifecycleError("ACTIVE_GRANT_REQUIRED", "No source content was read because there is no active permission grant for this reviewed scope.");
   }
-  assertPersistedGrantStillMatchesReview(grant, entry, clock);
+  assertPersistedSourcePermissionGrantStillMatchesReview(grant, entry, clock);
 
   if (typeof connector.registerPermissionGrant !== "function") {
     throw new PermissionLifecycleError("PERMISSION_GRANT_RESTORE_FAILED", "I could not restore the saved read-only permission safely, so no source content was read.");
@@ -846,27 +1437,208 @@ export async function fetchApprovedSourceContent({ message, stateStore, connecto
   if (!result || result.rawBodiesReturned === true || !Array.isArray(result.records)) {
     throw new PermissionLifecycleError("CONNECTOR_BODY_BOUNDARY_INVALID", "The simulated connector did not preserve the safe source-body boundary, so I stopped before exposing any content.");
   }
+  const approvedRecords = result.records.map((record) => {
+    if (record?.source !== undefined && record.source !== source) {
+      throw new PermissionLifecycleError("CONNECTOR_SOURCE_SUBSTITUTION", "The connector returned a record for a different source, so I stopped before exposing it.");
+    }
+    const mediaReferenceIds = record?.mediaReferenceIds;
+    if (mediaReferenceIds !== undefined && (source !== "whatsapp" || !Array.isArray(mediaReferenceIds)
+      || mediaReferenceIds.some((value) => typeof value !== "string" || !/^wa-media-[a-f0-9]{20}$/.test(value))
+      || new Set(mediaReferenceIds).size !== mediaReferenceIds.length)) {
+      throw new PermissionLifecycleError("CONNECTOR_MEDIA_BOUNDARY_INVALID", "The connector did not preserve the private media-reference boundary, so I stopped before exposing it.");
+    }
+    const sourceRecordId = String(record.sourceRecordId ?? record.id);
+    if (source === "whatsapp" && !/^wa-message-[a-f0-9]{20}$/.test(sourceRecordId)) {
+      throw new PermissionLifecycleError("CONNECTOR_RECORD_ALIAS_INVALID", "The WhatsApp connector returned a non-local message identifier, so I stopped before exposing it.");
+    }
+    return {
+      sourceRecordId,
+      processingDisposition: "untrusted-inert-reference",
+      source: record.source ?? source,
+      ...(mediaReferenceIds?.length ? { mediaReferenceIds: [...mediaReferenceIds] } : {})
+    };
+  });
+  const contentBodiesRead = result.contentBodiesRead !== false;
+  if (!contentBodiesRead && result.records.length > 0) {
+    throw new PermissionLifecycleError("CONNECTOR_BODY_BOUNDARY_INVALID", "The simulated connector reported approved records without reading their source bodies, so I stopped before exposing any content.");
+  }
+  let fetchCheckpoint;
+  if (source === "whatsapp") {
+    const checkpoint = result.fetchCheckpoint;
+    const allowedKeys = ["protocol", "planBinding", "index", "unitRef", "phase", "records", "receiptBinding"];
+    const checkpointKeys = checkpoint && typeof checkpoint === "object" && !Array.isArray(checkpoint) ? Object.keys(checkpoint) : [];
+    if (!checkpoint || checkpoint.protocol !== "qwave.whatsapp-snapshot-fetch-receipt/v1"
+      || !/^wa-fetch-plan-[a-f0-9]{24}$/.test(checkpoint.planBinding)
+      || !Number.isSafeInteger(checkpoint.index) || checkpoint.index < 0
+      || !/^wa-(?:segment|media)-[a-f0-9]{20}$/.test(checkpoint.unitRef)
+      || !["segment", "media"].includes(checkpoint.phase)
+      || !/^wa-fetch-receipt-[a-f0-9]{24}$/.test(checkpoint.receiptBinding)
+      || checkpointKeys.some((key) => !allowedKeys.includes(key))
+      || JSON.stringify(checkpoint.records) !== JSON.stringify(result.records)) {
+      throw new PermissionLifecycleError("CONNECTOR_FETCH_CHECKPOINT_INVALID", "The WhatsApp connector did not return an exact safe unit receipt, so I stopped before advancing its durable cursor.");
+    }
+    fetchCheckpoint = clone(checkpoint);
+  }
   const now = isoNow(clock);
-  entry.bodyFetches += 1;
-  entry.audit.push({ type: "approved-content-fetch", at: now, reviewId, grantId: grant.id, recordCount: result.records.length });
-  pushAudit(lifecycle, { type: "approved-content-fetch", at: now, source, accountId, reviewId, grantId: grant.id, recordCount: result.records.length });
+  if (contentBodiesRead) entry.bodyFetches += 1;
+  if (source === "whatsapp") {
+    // Persist only opaque aliases and the exact bounded-unit receipt. A
+    // specialized local wrapper can resume an interrupted outer save without
+    // re-reading a completed private source unit after restart.
+    entry.lastApprovedFetch = {
+      reviewId,
+      grantId: grant.id,
+      completedAt: now,
+      records: clone(approvedRecords),
+      fetchCheckpoint
+    };
+  }
+  entry.audit.push({
+    type: "approved-content-fetch",
+    at: now,
+    reviewId,
+    grantId: grant.id,
+    recordCount: result.records.length,
+    contentBodiesRead,
+    ...(fetchCheckpoint ? { unitRef: fetchCheckpoint.unitRef } : {})
+  });
+  pushAudit(lifecycle, {
+    type: "approved-content-fetch",
+    at: now,
+    source,
+    accountId,
+    reviewId,
+    grantId: grant.id,
+    recordCount: result.records.length,
+    contentBodiesRead,
+    ...(fetchCheckpoint ? { unitRef: fetchCheckpoint.unitRef } : {})
+  });
   await stateStore.save(state);
 
   return {
-    permissionReview: publicReview(entry, languageFor(state, language)),
-    approvedRecords: result.records.map((record) => ({
-      sourceRecordId: String(record.sourceRecordId ?? record.id),
-      processingDisposition: "untrusted-inert-reference",
-      source: record.source ?? source
-    }))
+    permissionReview: permissionReviewRenderer(entry, languageFor(state, language)),
+    approvedRecords,
+    ...(fetchCheckpoint ? { fetchCheckpoint: clone(fetchCheckpoint) } : {})
   };
 }
 
-/** Read-only public status boundary for reviews, grants, and revocations. */
-export async function getSourcePermissionStatus({ stateStore, source, accountId, language }) {
-  assertStateStore(stateStore);
-  const state = await stateStore.load();
+export async function fetchApprovedSourceContent(args) {
+  assertPublicLifecycleSource(args?.source);
+  return withSourcePermissionStateLock(args?.stateStore, () => fetchApprovedSourceContentInternal({ ...args, permissionReviewRenderer: publicReview }));
+}
+
+export async function fetchApprovedSourceContentWithinStateLock(args) {
+  assertPublicLifecycleSource(args?.source);
+  return runWithinHeldSourcePermissionStateLock(args?.stateStore, () => fetchApprovedSourceContentInternal({ ...args, permissionReviewRenderer: publicReview }));
+}
+
+export async function fetchApprovedSpecializedSourceContent(args) {
+  assertSpecializedSlackSource(args?.source);
+  return runWithinHeldSourcePermissionStateLock(args?.stateStore, () => fetchApprovedSourceContentInternal({ ...args, permissionReviewRenderer: publicReview }));
+}
+
+export async function fetchSpecializedWhatsAppContent(args) {
+  assertSpecializedWhatsAppSource(args?.source);
+  return runWithinHeldSourcePermissionStateLock(args?.stateStore, () => fetchApprovedSourceContentInternal({ ...args, permissionReviewRenderer: specializedWhatsAppPublicReview }));
+}
+
+function getSourcePermissionStatusFromStateInternal({
+  state,
+  source,
+  accountId,
+  language,
+  permissionReviewRenderer = publicReview,
+}) {
   if (!state?.[STATE_KEY]) return null;
   const entry = state[STATE_KEY].entries[sourceKey(source, accountId)];
-  return entry ? { permissionReview: publicReview(entry, languageFor(state, language)) } : null;
+  return entry
+    ? { permissionReview: permissionReviewRenderer(entry, languageFor(state, language)) }
+    : null;
+}
+
+/** Shared read-only primitive for public generic and Slack-specialized status views. */
+async function getSourcePermissionStatusInternal({
+  stateStore,
+  source,
+  accountId,
+  language,
+  permissionReviewRenderer = publicReview,
+}) {
+  assertStateStore(stateStore);
+  const state = await stateStore.load();
+  return getSourcePermissionStatusFromStateInternal({
+    state,
+    source,
+    accountId,
+    language,
+    permissionReviewRenderer,
+  });
+}
+
+/** Read-only public status boundary for non-Slack reviews, grants, and revocations. */
+export async function getSourcePermissionStatus(args) {
+  assertPublicLifecycleSource(args?.source);
+  return getSourcePermissionStatusInternal({ ...args, permissionReviewRenderer: publicReview });
+}
+
+// Connector writer flows that already own the shared Setup Session write lock
+// may need a fresh, local permission view while preserving one serialized
+// lifecycle. This deliberately does not acquire a second lock and is not
+// re-exported from src/index.mjs.
+export async function getSourcePermissionStatusWithinStateLock(args) {
+  assertPublicLifecycleSource(args?.source);
+  return runWithinHeldSourcePermissionStateLock(args?.stateStore, () =>
+    getSourcePermissionStatusInternal({ ...args, permissionReviewRenderer: publicReview })
+  );
+}
+
+// Connector lifecycles that already hold the full Setup Session lock use this
+// pure view to compose one truthful status from the exact root snapshot they
+// loaded. It is intentionally not re-exported from src/index.mjs.
+export function getSourcePermissionStatusFromState(args) {
+  assertPublicLifecycleSource(args?.source);
+  return getSourcePermissionStatusFromStateInternal({
+    ...args,
+    permissionReviewRenderer: publicReview,
+  });
+}
+
+// Deliberately not re-exported from src/index.mjs. Slack owns the public
+// status view so adapter identifiers cannot bypass its local opaque aliases.
+export async function getSpecializedSourcePermissionStatus(args) {
+  assertSpecializedSlackSource(args?.source);
+  return getSourcePermissionStatusInternal({ ...args, permissionReviewRenderer: publicReview });
+}
+
+// Deliberately not re-exported from src/index.mjs. Slack uses this pure view to
+// compose its public status from the exact same already-loaded root snapshot,
+// avoiding a second read that could otherwise race a re-entrant revoke.
+export function getSpecializedSourcePermissionStatusFromState(args) {
+  assertSpecializedSlackSource(args?.source);
+  return getSourcePermissionStatusFromStateInternal({
+    ...args,
+    permissionReviewRenderer: publicReview,
+  });
+}
+
+// Deliberately not re-exported from src/index.mjs. The WhatsApp connector owns
+// its public status surface so raw local snapshot aliases and generalized
+// permission endpoints cannot bypass its private lifecycle boundary.
+export async function getSpecializedWhatsAppPermissionStatus(args) {
+  assertSpecializedWhatsAppSource(args?.source);
+  return getSourcePermissionStatusInternal({
+    ...args,
+    permissionReviewRenderer: specializedWhatsAppPublicReview,
+  });
+}
+
+// This pure variant lets the WhatsApp connector compose its status from the
+// exact root snapshot already loaded under its shared lock. It must not save,
+// reconcile, create an adapter, or take a second state snapshot.
+export function getSpecializedWhatsAppPermissionStatusFromState(args) {
+  assertSpecializedWhatsAppSource(args?.source);
+  return getSourcePermissionStatusFromStateInternal({
+    ...args,
+    permissionReviewRenderer: specializedWhatsAppPublicReview,
+  });
 }

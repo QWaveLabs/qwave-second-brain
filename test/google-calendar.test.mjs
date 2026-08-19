@@ -15,7 +15,10 @@ import {
   beginSourcePermissionReview,
   fetchApprovedGoogleCalendarContent,
   getGoogleCalendarStatus,
+  getSourcePermissionStatus,
   grantGoogleCalendarContent,
+  grantSourcePermission,
+  revokeSourcePermission,
   startSetupSession
 } from "../src/index.mjs";
 
@@ -163,6 +166,188 @@ test("Calendar is a separate read-only natural-language lifecycle with the speci
     assert.equal("body" in fetched.approvedRecords[0], false);
     assert.equal(connector.eventDetailFetches, 1);
     assert.equal(connector.writeCalls, 0);
+  });
+});
+
+test("a Calendar full-root save cannot resurrect another source grant revoked through the same Setup Session", async () => {
+  await withCalendarFixture(async ({ directory, stateStore, connector }) => {
+    const gmail = new SimulatedReadOnlyConnector({
+      source: "gmail",
+      account: { id: "calendar-race-gmail", label: "Work email" },
+      people: [{ id: "calendar-race-person", label: "Reviewed person", accessLevel: "allowed" }],
+      items: [{
+        id: "calendar-race-message",
+        kind: "conversation",
+        area: "inbox",
+        conversation: "calendar-race-message",
+        category: "work",
+        participantIds: ["calendar-race-person"],
+        label: "Safe simulated metadata"
+      }]
+    });
+    const gmailReview = await beginSourcePermissionReview({
+      message: "Review Gmail before Calendar",
+      stateStore,
+      connector: gmail,
+      source: "gmail",
+      reviewIdFactory: () => "calendar-race-gmail-review"
+    });
+    const gmailScope = structuredClone(gmailReview.permissionReview.permissionRequest.requestedScope);
+    gmailScope.acknowledgements.modelProcessing = true;
+    gmailScope.acknowledgements.untrustedSourceMaterial = true;
+    await grantSourcePermission({
+      message: "Approve the reviewed Gmail scope",
+      stateStore,
+      connector: gmail,
+      source: "gmail",
+      accountId: "calendar-race-gmail",
+      reviewId: "calendar-race-gmail-review",
+      scope: gmailScope,
+      grantIdFactory: () => "calendar-race-gmail-grant"
+    });
+
+    connector.setConnectionStatus("unavailable");
+    let signalStatusRead;
+    const statusRead = new Promise((resolve) => { signalStatusRead = resolve; });
+    let releaseStatusRead;
+    const statusReadReleased = new Promise((resolve) => { releaseStatusRead = resolve; });
+    const originalStatus = connector.getReadOnlyStatus.bind(connector);
+    connector.getReadOnlyStatus = async () => {
+      signalStatusRead();
+      await statusReadReleased;
+      return originalStatus();
+    };
+
+    const calendarAttempt = beginGoogleCalendarReview({
+      message: "Review Calendar while another source is being revoked",
+      stateStore,
+      connector,
+      clock,
+      reviewIdFactory: () => "calendar-race-review"
+    });
+    await statusRead;
+    const resumedStateStore = new FileStateStore(path.join(directory, "private-state", "..", "private-state", "setup-session.json"));
+    const gmailRevocation = revokeSourcePermission({
+      message: "Revoke Gmail during the Calendar availability check",
+      stateStore: resumedStateStore,
+      connector: gmail,
+      source: "gmail",
+      accountId: "calendar-race-gmail",
+      reviewId: "calendar-race-gmail-review",
+      clock
+    });
+    releaseStatusRead();
+    const [calendarResult, revoked] = await Promise.all([calendarAttempt, gmailRevocation]);
+    assert.equal(calendarResult.metadataReviewUnavailable, true);
+    assert.equal(revoked.permissionReview.status, "revoked");
+    const saved = await getSourcePermissionStatus({
+      stateStore: resumedStateStore,
+      source: "gmail",
+      accountId: "calendar-race-gmail"
+    });
+    assert.equal(saved.permissionReview.status, "revoked");
+    assert.equal(saved.permissionReview.activeGrant, null);
+  });
+});
+
+test("a same-context callback cannot re-enter a Calendar writer and overwrite its stale full-root snapshot", async () => {
+  await withCalendarFixture(async ({ stateStore, connector }) => {
+    const gmail = new SimulatedReadOnlyConnector({
+      source: "gmail",
+      account: { id: "calendar-reentrant-gmail", label: "Work email" },
+      people: [{ id: "calendar-reentrant-person", label: "Reviewed person", accessLevel: "allowed" }],
+      items: [{
+        id: "calendar-reentrant-message",
+        kind: "conversation",
+        area: "inbox",
+        conversation: "calendar-reentrant-message",
+        category: "work",
+        participantIds: ["calendar-reentrant-person"],
+        label: "Safe simulated metadata"
+      }]
+    });
+    const reviewId = "calendar-reentrant-gmail-review";
+    const gmailReview = await beginSourcePermissionReview({
+      message: "Review Gmail before the hooked Calendar callback",
+      stateStore,
+      connector: gmail,
+      source: "gmail",
+      reviewIdFactory: () => reviewId
+    });
+    const gmailScope = structuredClone(gmailReview.permissionReview.permissionRequest.requestedScope);
+    gmailScope.acknowledgements.modelProcessing = true;
+    gmailScope.acknowledgements.untrustedSourceMaterial = true;
+    await grantSourcePermission({
+      message: "Approve the reviewed Gmail scope",
+      stateStore,
+      connector: gmail,
+      source: "gmail",
+      accountId: "calendar-reentrant-gmail",
+      reviewId,
+      scope: gmailScope,
+      grantIdFactory: () => "calendar-reentrant-gmail-grant"
+    });
+
+    connector.setConnectionStatus("unavailable");
+    const filePath = stateStore.filePath;
+    let triggerNestedRevoke = true;
+    let nestedError = null;
+    const hookedStateStore = {
+      filePath,
+      async load() {
+        const snapshot = await stateStore.load();
+        if (triggerNestedRevoke) {
+          triggerNestedRevoke = false;
+          try {
+            await revokeSourcePermission({
+              message: "Attempt a nested Gmail revoke from Calendar state loading",
+              stateStore: new FileStateStore(filePath),
+              connector: gmail,
+              source: "gmail",
+              accountId: "calendar-reentrant-gmail",
+              reviewId,
+              clock
+            });
+          } catch (error) {
+            nestedError = error;
+          }
+        }
+        return snapshot;
+      },
+      async save(state) {
+        return stateStore.save(state);
+      }
+    };
+
+    const calendarResult = await beginGoogleCalendarReview({
+      message: "Review Calendar through the hooked state store",
+      stateStore: hookedStateStore,
+      connector,
+      clock,
+      reviewIdFactory: () => "calendar-reentrant-review"
+    });
+    assert.equal(calendarResult.metadataReviewUnavailable, true);
+    assert.equal(nestedError?.code, "STATE_LOCK_REENTRANT_OPERATION_BLOCKED");
+    assert.equal(gmail.grantRevocationCalls, 0);
+    const unchanged = await getSourcePermissionStatus({
+      stateStore,
+      source: "gmail",
+      accountId: "calendar-reentrant-gmail"
+    });
+    assert.equal(unchanged.permissionReview.status, "granted");
+    assert.notEqual(unchanged.permissionReview.activeGrant, null);
+
+    const revoked = await revokeSourcePermission({
+      message: "Revoke Gmail after the Calendar step has finished",
+      stateStore,
+      connector: gmail,
+      source: "gmail",
+      accountId: "calendar-reentrant-gmail",
+      reviewId,
+      clock
+    });
+    assert.equal(revoked.permissionReview.status, "revoked");
+    assert.equal(gmail.grantRevocationCalls, 1);
   });
 });
 

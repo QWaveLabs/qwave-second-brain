@@ -115,6 +115,16 @@ export class SimulatedGmailPlugin {
   async revokePermissionGrant({ grantId }) {
     this.grantRevocationCalls += 1;
     this.authorizedGrantIds.delete(grantId);
+    return { status: "revoked", revoked: true, grantId };
+  }
+
+  async getPermissionGrantStatus({ grantId }) {
+    return {
+      grantId,
+      status: this.authorizedGrantIds.has(grantId) ? "active" : "revoked",
+      active: this.authorizedGrantIds.has(grantId),
+      revoked: !this.authorizedGrantIds.has(grantId)
+    };
   }
 
   async fetchApprovedPage({ source, accountId, grant, pageToken, pageSize }) {

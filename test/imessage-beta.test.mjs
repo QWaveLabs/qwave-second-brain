@@ -122,6 +122,36 @@ function approvedScope(permissionReview) {
   return scope;
 }
 
+test("iMessage lifecycle saves create opaque aliases before any final handoff", async () => {
+  await withIMessageFixture(async ({ stateStore, connector }) => {
+    await beginIMessageBeta({
+      message: "Please connect iMessage to my second brain",
+      stateStore
+    });
+    await beginIMessageSnapshotImport({
+      message: "Please import an iMessage snapshot",
+      stateStore,
+      connector,
+      reviewIdFactory: () => "imessage-writer-review"
+    });
+
+    const state = await stateStore.load();
+    const [entry] = Object.values(state.imessageBetaLifecycle.entries);
+    const accountAlias = entry.publicIdentifierAliases.mappings.find(
+      (mapping) => mapping.kind === "account" && mapping.raw === accountId
+    );
+    const reviewAlias = entry.publicIdentifierAliases.mappings.find(
+      (mapping) => mapping.kind === "review" && mapping.raw === "imessage-writer-review"
+    );
+
+    assert.equal(entry.publicIdentifierAliases.namespace, "imessage");
+    assert.equal(accountAlias.alias.startsWith("local-imessage-account-"), true);
+    assert.notEqual(accountAlias.alias, accountId);
+    assert.equal(reviewAlias.alias.startsWith("local-imessage-review-"), true);
+    assert.notEqual(reviewAlias.alias, "imessage-writer-review");
+  });
+});
+
 test("local iMessage access is never attempted before explicit macOS approval", async () => {
   await withIMessageFixture(async ({ stateStore, connector, localAdapter }) => {
     const offered = await beginIMessageBeta({
