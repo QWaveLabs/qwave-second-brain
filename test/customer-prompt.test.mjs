@@ -5,7 +5,7 @@ import test from "node:test";
 
 const root = path.resolve(import.meta.dirname, "..");
 
-test("the customer receives one direct prompt that clones the private repository and starts a guided setup", async () => {
+test("the customer receives one direct prompt that clones the public repository and starts a guided setup", async () => {
   const [prompt, instructions] = await Promise.all([
     readFile(path.join(root, "CUSTOMER_PROMPT.md"), "utf8"),
     readFile(path.join(root, "AGENTS.md"), "utf8")

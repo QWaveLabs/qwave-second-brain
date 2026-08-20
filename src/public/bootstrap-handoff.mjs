@@ -1,8 +1,8 @@
 /**
  * QWA-144 customer bootstrap handoff.
  *
- * The approved release model is one private QWave repository. This boundary
- * makes the private-repository clone handoff safe
+ * The approved release model is one public QWave repository. This boundary
+ * makes the public-repository clone handoff safe
  * and resumable before Setup Session begins; the customer never receives a
  * terminal procedure.
  */
@@ -11,7 +11,7 @@ export const QWAVE_INSTALLER_VERSION = "0.1.0";
 
 export const DISTRIBUTION_VISIBILITIES = Object.freeze(["public", "private"]);
 export const QWAVE_DISTRIBUTION = Object.freeze({
-  repositoryVisibility: "private"
+  repositoryVisibility: "public"
 });
 
 export const BOOTSTRAP_CAPABILITIES = Object.freeze([
@@ -104,7 +104,7 @@ function safeRepositoryReference(repositoryReference) {
 
 /**
  * The one message a customer can paste into Codex. QWave may embed its approved
- * private runtime link, but no credential may be embedded and no terminal
+ * public repository link, but no credential may be embedded and no terminal
  * action is delegated to the customer.
  */
 export function buildCustomerBootstrapPrompt({ language = "en", repositoryReference } = {}) {
@@ -113,9 +113,9 @@ export function buildCustomerBootstrapPrompt({ language = "en", repositoryRefere
     throw new TypeError("language must be 'en' or 'es'.");
   }
   if (language === "es") {
-    return `Quiero configurar mi QWave Second Brain. Usa ${repository} para preparar o continuar la copia privada aprobada. Confirma que el runtime es privado antes de clonarlo. Haz la configuración local segura por mí; no me pidas usar Terminal ni comandos. Habla en español claro, pide una sola decisión a la vez solo cuando necesites mi aprobación de privacidad, seguridad o inicio de sesión, y deja todas las fuentes en solo lectura hasta que yo otorgue un permiso específico. Si existe una configuración protegida, reanúdala. Antes de terminar, dime con honestidad qué está verificado en vivo, importado una sola vez, omitido, en beta o bloqueado.`;
+    return `Quiero configurar mi QWave Second Brain. Usa ${repository} para preparar o continuar la copia aprobada de QWave. Confirma que la fuente es pública antes de clonarla. Haz la configuración local segura por mí; no me pidas usar Terminal ni comandos. Habla en español claro, pide una sola decisión a la vez solo cuando necesites mi aprobación de privacidad, seguridad o inicio de sesión, y deja todas las fuentes en solo lectura hasta que yo otorgue un permiso específico. Si existe una configuración protegida, reanúdala. Antes de terminar, dime con honestidad qué está verificado en vivo, importado una sola vez, omitido, en beta o bloqueado.`;
   }
-  return `I want to set up my QWave Second Brain. Use ${repository} to prepare or continue the approved private runtime copy. Confirm that the runtime is private before cloning it. Do the safe local setup for me; do not ask me to use Terminal or commands. Use clear English, ask one decision at a time only when you need my privacy, security, or sign-in approval, and keep every source read-only until I grant a specific permission. If a protected setup already exists, resume it. Before you finish, tell me truthfully what is live and verified, imported once, skipped, beta-only, or blocked.`;
+  return `I want to set up my QWave Second Brain. Use ${repository} to prepare or continue the approved QWave copy. Confirm that the source is public before cloning it. Do the safe local setup for me; do not ask me to use Terminal or commands. Use clear English, ask one decision at a time only when you need my privacy, security, or sign-in approval, and keep every source read-only until I grant a specific permission. If a protected setup already exists, resume it. Before you finish, tell me truthfully what is live and verified, imported once, skipped, beta-only, or blocked.`;
 }
 
 /**

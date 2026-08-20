@@ -13,7 +13,7 @@
     "publicVaultRepository": false
   },
   "distribution": {
-    "repository": "private QWave Git repository",
+    "repository": "public QWave Git repository",
     "visibilityReadbackRequiredBeforeClone": true,
     "remotesConfigured": true
   },

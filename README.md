@@ -5,15 +5,15 @@ private Obsidian second brain through one guided Codex Desktop conversation.
 
 ## Customer start
 
-Give the customer access to this private repository, then send them the exact
-prompt in [CUSTOMER_PROMPT.md](CUSTOMER_PROMPT.md). They paste it into Codex
+Send the customer the exact prompt in [CUSTOMER_PROMPT.md](CUSTOMER_PROMPT.md).
+They paste it into Codex
 Desktop. Codex pulls this repository, reads its setup instructions, and starts
 or resumes the guided setup. The customer never needs Terminal or commands.
 
 ## What this package is
 
-- A private, QWave-branded repository and natural-language operating guide.
-- A private QWave runtime that Codex may clone only after visibility readback.
+- A public, QWave-branded repository and natural-language operating guide.
+- A public QWave setup repository that Codex may clone after visibility readback.
 - A guide for a separate, private customer vault on the Desktop.
 - A release candidate with a resumable bootstrap handoff and Setup Session API.
 
@@ -22,10 +22,9 @@ vault repository, or real-time background capture product.
 
 ## Current release boundary
 
-The first usable handoff is this private QWave repository. The customer gets
-repository access and one prompt; no separate public bootstrap is needed for
-that flow. Customer vault history remains local-only or uses a verified private
-remote.
+The first usable handoff is this public QWave repository and one prompt; no
+repository invitation or separate bootstrap is needed. Customer vault history
+remains local-only or uses a verified private remote.
 
 ## Supported environment and diagnostics
 

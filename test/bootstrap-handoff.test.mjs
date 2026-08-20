@@ -11,7 +11,7 @@ import {
 } from "../src/index.mjs";
 
 class SimulatedRepositoryAdapter {
-  constructor({ visibility = "private", available = false } = {}) {
+  constructor({ visibility = "public", available = false } = {}) {
     this.visibility = visibility;
     this.available = available;
     this.root = "/simulated/QWave Second Brain";
@@ -44,13 +44,13 @@ test("the customer bootstrap prompt is one normal-language request with the requ
 
   assert.match(prompt, /^I want to set up my QWave Second Brain\./);
   assert.match(prompt, /one decision at a time/i);
-  assert.match(prompt, /runtime is private before cloning/i);
+  assert.match(prompt, /source is public before cloning/i);
   assert.match(prompt, /read-only/i);
   assert.match(prompt, /live and verified, imported once, skipped, beta-only, or blocked/i);
   assert.doesNotMatch(prompt, /^\//m);
   assert.equal(QWAVE_INSTALLER_VERSION, "0.1.0");
   assert.deepEqual(QWAVE_DISTRIBUTION, {
-    repositoryVisibility: "private"
+    repositoryVisibility: "public"
   });
   assert.deepEqual(BOOTSTRAP_CAPABILITIES, [
     "set up", "connect", "review privacy", "build", "refresh", "audit", "show", "restore", "improve"
@@ -75,12 +75,12 @@ test("repository references reject credential-bearing or multiline values before
   );
 });
 
-test("an approved private source clones once and a resumed handoff reuses the exact checkout", async () => {
-  const repository = new SimulatedRepositoryAdapter({ visibility: "private" });
+test("an approved public source clones once and a resumed handoff reuses the exact checkout", async () => {
+  const repository = new SimulatedRepositoryAdapter({ visibility: "public" });
   const first = await prepareBootstrapHandoff({
     message: "Set up my QWave Second Brain",
     repository,
-    requiredVisibility: "private"
+    requiredVisibility: "public"
   });
   assert.deepEqual(first, {
     status: "ready",
@@ -93,7 +93,7 @@ test("an approved private source clones once and a resumed handoff reuses the ex
   const resumed = await prepareBootstrapHandoff({
     message: "Continue setting up my second brain",
     repository,
-    requiredVisibility: "private"
+    requiredVisibility: "public"
   });
   assert.equal(resumed.status, "ready");
   assert.equal(resumed.cloned, false);
@@ -101,12 +101,12 @@ test("an approved private source clones once and a resumed handoff reuses the ex
 });
 
 test("a source with the wrong or unverifiable visibility stops before cloning", async () => {
-  for (const visibility of ["public", "unknown", null]) {
+  for (const visibility of ["private", "unknown", null]) {
     const repository = new SimulatedRepositoryAdapter({ visibility });
     const outcome = await prepareBootstrapHandoff({
       message: "Set up my QWave Second Brain",
       repository,
-      requiredVisibility: "private"
+      requiredVisibility: "public"
     });
     assert.equal(outcome.status, "blocked");
     assert.equal(repository.cloneCalls, 0);
@@ -114,8 +114,8 @@ test("a source with the wrong or unverifiable visibility stops before cloning", 
   }
 });
 
-test("the approved private-runtime policy is the default and rejects a public runtime", async () => {
-  const repository = new SimulatedRepositoryAdapter({ visibility: "public" });
+test("the approved public-repository policy is the default and rejects a private source", async () => {
+  const repository = new SimulatedRepositoryAdapter({ visibility: "private" });
   const outcome = await prepareBootstrapHandoff({
     message: "Set up my QWave Second Brain",
     repository
@@ -130,7 +130,7 @@ test("an unrecognized or slash-command request never inspects or clones a reposi
     () => prepareBootstrapHandoff({
       message: "/setup second brain",
       repository,
-      requiredVisibility: "private"
+      requiredVisibility: "public"
     }),
     (error) => {
       assert.ok(error instanceof BootstrapHandoffError);

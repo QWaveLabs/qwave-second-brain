@@ -18,10 +18,10 @@ test("the release package points customers to one ordinary-language prompt and r
   ]);
   assert.match(readme, /CUSTOMER_PROMPT\.md/);
   assert.match(prompt, /I want to set up my QWave Second Brain\./);
-  assert.match(readme, /first usable handoff is this private QWave repository/i);
+  assert.match(readme, /first usable handoff is this public QWave repository/i);
   assert.match(prompt, /one question at a time/i);
   assert.match(prompt, /do not ask me to use Terminal or run commands/i);
-  assert.match(readme, /customer gets\s+repository access and one prompt/i);
+  assert.match(readme, /one prompt; no\s+repository invitation/i);
   assert.match(license, /^MIT License/m);
   assert.match(notices, /Nate Herk/);
 });
@@ -34,7 +34,7 @@ test("installer diagnostics expose version, supported environment, migration bou
   assert.deepEqual(diagnostic.supportedEnvironment.languages, ["English", "Spanish"]);
   assert.equal(diagnostic.customerOwnership.publicVaultRepository, false);
   assert.deepEqual(diagnostic.distribution, {
-    repository: "private QWave Git repository",
+    repository: "public QWave Git repository",
     visibilityReadbackRequiredBeforeClone: true,
     remotesConfigured: true
   });

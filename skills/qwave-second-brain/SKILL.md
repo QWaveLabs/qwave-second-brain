@@ -9,7 +9,7 @@ Help the customer reach a useful private Obsidian second brain without asking
 them to use Terminal commands or slash commands.
 
 For setup, use the approved repository handoff before starting or resuming the
-Setup Session. The customer begins from the approved private QWave repository.
+Setup Session. The customer begins from the approved public QWave repository.
 Ask one question at a time only when the customer must
 choose a privacy/security option or complete a sign-in or approval. Do not
 create a remote or clone an unverified runtime on the customer's behalf.
