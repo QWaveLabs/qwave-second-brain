@@ -5,6 +5,13 @@
 
 import { mkdir, open, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
+import {
+  QWAVE_SUPPORT_MAX_PAYLOAD_BYTES,
+  QWAVE_SUPPORT_MAX_REPORTS_PER_INSTALLATION,
+  QWAVE_SUPPORT_RATE_LIMIT_WINDOW_MS,
+  QWaveSupportEscalationError,
+  validateQWaveSupportRelayRequest
+} from "../support/qwave-support-escalation.mjs";
 
 const FILE_STATE_STORE_AUTHORITIES = new WeakMap();
 
@@ -78,11 +85,22 @@ export class FileStateStore {
 }
 
 export class SimulatedEnvironmentAdapter {
-  constructor({ supported = true, summary = "Simulated private Mac environment", customerMessage, sharedProfile = false } = {}) {
+  constructor({
+    supported = true,
+    summary = "Simulated private Mac environment",
+    customerMessage,
+    sharedProfile = false,
+    macOSVersion = "15.0",
+    architecture = "arm64",
+    timezone = "America/New_York"
+  } = {}) {
     this.supported = supported;
     this.summary = summary;
     this.customerMessage = customerMessage;
     this.sharedProfile = sharedProfile;
+    this.macOSVersion = macOSVersion;
+    this.architecture = architecture;
+    this.timezone = timezone;
     this.inspectCalls = 0;
   }
 
@@ -92,8 +110,110 @@ export class SimulatedEnvironmentAdapter {
       supported: this.supported,
       summary: this.summary,
       customerMessage: this.customerMessage,
-      sharedProfile: this.sharedProfile
+      sharedProfile: this.sharedProfile,
+      macOSVersion: this.macOSVersion,
+      architecture: this.architecture,
+      timezone: this.timezone
     };
+  }
+}
+
+function clockNowMilliseconds(clock) {
+  const value = clock?.now ? clock.now() : new Date();
+  const milliseconds = value instanceof Date ? value.getTime() : new Date(value).getTime();
+  return Number.isFinite(milliseconds) ? milliseconds : Date.now();
+}
+
+/**
+ * In-memory proof relay for QWA-151. It never contacts an email provider. Its
+ * small bounded cache models the controlled relay's schema, recipient, rate,
+ * and duplicate protections without creating a customer profile or retaining
+ * customer source data.
+ */
+export class SimulatedQWaveSupportRelay {
+  constructor({
+    failuresBeforeSuccess = 0,
+    maxPayloadBytes = QWAVE_SUPPORT_MAX_PAYLOAD_BYTES,
+    maxReportsPerInstallation = QWAVE_SUPPORT_MAX_REPORTS_PER_INSTALLATION,
+    rateLimitWindowMs = QWAVE_SUPPORT_RATE_LIMIT_WINDOW_MS,
+    clock
+  } = {}) {
+    if (!Number.isInteger(failuresBeforeSuccess) || failuresBeforeSuccess < 0) {
+      throw new TypeError("failuresBeforeSuccess must be a non-negative integer.");
+    }
+    if (!Number.isInteger(maxPayloadBytes) || maxPayloadBytes < 256) {
+      throw new TypeError("maxPayloadBytes must be an integer of at least 256 bytes.");
+    }
+    if (!Number.isInteger(maxReportsPerInstallation) || maxReportsPerInstallation < 1) {
+      throw new TypeError("maxReportsPerInstallation must be a positive integer.");
+    }
+    if (!Number.isInteger(rateLimitWindowMs) || rateLimitWindowMs < 1) {
+      throw new TypeError("rateLimitWindowMs must be a positive integer.");
+    }
+
+    this.failuresBeforeSuccess = failuresBeforeSuccess;
+    this.maxPayloadBytes = maxPayloadBytes;
+    this.maxReportsPerInstallation = maxReportsPerInstallation;
+    this.rateLimitWindowMs = rateLimitWindowMs;
+    this.clock = clock;
+    this.sendCalls = 0;
+    this.requests = [];
+    this.deliveries = [];
+    this.#attemptsByInstallation = new Map();
+    this.#deliveredReportKeys = new Set();
+  }
+
+  #attemptsByInstallation;
+  #deliveredReportKeys;
+
+  #reportKey(request) {
+    return [
+      request.report.installationId,
+      request.report.setup.stage,
+      request.report.failure.category
+    ].join(":");
+  }
+
+  #recordRateLimitedAttempt(installationId, now) {
+    const previous = this.#attemptsByInstallation.get(installationId) ?? [];
+    const recent = previous.filter((attemptedAt) => now - attemptedAt < this.rateLimitWindowMs);
+    if (recent.length >= this.maxReportsPerInstallation) {
+      throw new QWaveSupportEscalationError(
+        "SUPPORT_REPORT_RATE_LIMITED",
+        "The support relay rate limit has been reached for this anonymous installation."
+      );
+    }
+    recent.push(now);
+    this.#attemptsByInstallation.set(installationId, recent);
+  }
+
+  async send(request) {
+    validateQWaveSupportRelayRequest(request, { maxPayloadBytes: this.maxPayloadBytes });
+
+    const key = this.#reportKey(request);
+    if (this.#deliveredReportKeys.has(key)) {
+      throw new QWaveSupportEscalationError(
+        "SUPPORT_REPORT_DUPLICATE",
+        "The support relay already accepted this blocked setup report."
+      );
+    }
+
+    const now = clockNowMilliseconds(this.clock);
+    this.#recordRateLimitedAttempt(request.report.installationId, now);
+    this.sendCalls += 1;
+    this.requests.push(structuredClone(request));
+
+    if (this.failuresBeforeSuccess > 0) {
+      this.failuresBeforeSuccess -= 1;
+      throw new QWaveSupportEscalationError(
+        "SUPPORT_RELAY_UNAVAILABLE",
+        "The simulated support relay is temporarily unavailable."
+      );
+    }
+
+    this.#deliveredReportKeys.add(key);
+    this.deliveries.push(structuredClone(request));
+    return { delivered: true };
   }
 }
 

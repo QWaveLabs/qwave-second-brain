@@ -13,8 +13,8 @@ connected source was accessed.
   `/Applications/Obsidian.app` by its `md.obsidian` bundle identifier.
 - The pre-existing vault registry was read only for vault-path discovery. No
   existing vault note, attachment, or configuration body was opened or read.
-- A new, explicit target was created at
-  `/Users/rob/Desktop/My Second Brain`. The guarded writer was approved only
+- A new, explicit target was created at the private user's Desktop
+  `My Second Brain` child path. The guarded writer was approved only
   for that exact Desktop child path; it wrote only `Home.md`,
   `System/Status.md`, and its installation marker.
 - No source connector, account, secret, raw staging data, generated-vault
@@ -33,7 +33,7 @@ connected source was accessed.
    launch form. A second active-window readback still named `My Second Brain`.
 4. `continueSetupSession({ message: "Continue setting up my second brain" })`
    completed through the public boundary: `complete`, `5 of 5 setup steps`,
-   `openedVaultPath: /Users/rob/Desktop/My Second Brain`, and
+   the approved Desktop `My Second Brain` path as `openedVaultPath`, and
    `openVerified: true`.
 
 The active-window confirmation was deliberately supplied through the adapter's

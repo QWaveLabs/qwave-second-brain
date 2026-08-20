@@ -10,6 +10,8 @@
   "scripts": {
     "test": "node --test",
     "test:qwa-138": "node --test test/setup-session.test.mjs",
+    "test:qwa-144": "node --test test/bootstrap-handoff.test.mjs",
+    "test:qwa-154": "node --test test/private-history-contract.test.mjs",
     "test:qwa-139": "node --test test/source-permissions.test.mjs",
     "test:qwa-143": "node --test test/google-calendar.test.mjs",
     "test:qwa-141": "node --test test/onboarding.test.mjs",
@@ -20,6 +22,9 @@
     "test:qwa-146": "node --test test/approved-record-compiler.test.mjs",
     "test:qwa-147": "node --test test/whatsapp-snapshot.test.mjs",
     "test:qwa-149": "node --test test/source-status.test.mjs",
-    "proof:qwa-149": "node scripts/export-qwa-149-source-status-proof.mjs"
+    "test:qwa-151": "node --test test/qwa-support-escalation.test.mjs",
+    "proof:qwa-149": "node scripts/export-qwa-149-source-status-proof.mjs",
+    "scrub": "node scripts/public-scrub.mjs",
+    "diagnose": "node scripts/diagnose.mjs"
   }
 }

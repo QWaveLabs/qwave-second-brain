@@ -1,10 +1,29 @@
 export {
   BOOTSTRAP_EXAMPLES,
+  CONTACT_QWAVE_SUPPORT_ACTION,
   SETUP_STAGES,
+  SUPPORT_SAFE_REPAIR_ATTEMPT_LIMIT,
   continueSetupSession,
   getSetupSessionStatus,
   startSetupSession
 } from "./public/setup-session.mjs";
+
+export {
+  BOOTSTRAP_CAPABILITIES,
+  DISTRIBUTION_VISIBILITIES,
+  QWAVE_DISTRIBUTION,
+  QWAVE_INSTALLER_VERSION,
+  BootstrapHandoffError,
+  buildCustomerBootstrapPrompt,
+  prepareBootstrapHandoff
+} from "./public/bootstrap-handoff.mjs";
+
+export {
+  CHECKPOINT_KINDS,
+  HISTORY_MODES,
+  planHistoryCheckpoint,
+  planPrivateHistory
+} from "./history/private-history-contract.mjs";
 
 export {
   ONBOARDING_BATCHES,
@@ -17,8 +36,24 @@ export {
   FileStateStore,
   SimulatedDesktopVaultAdapter,
   SimulatedEnvironmentAdapter,
-  SimulatedObsidianAdapter
+  SimulatedObsidianAdapter,
+  SimulatedQWaveSupportRelay
 } from "./adapters/simulated-dependencies.mjs";
+
+export {
+  QWAVE_SUPPORT_INSTALLER_VERSION,
+  QWAVE_SUPPORT_MAX_PAYLOAD_BYTES,
+  QWAVE_SUPPORT_MAX_REPORTS_PER_INSTALLATION,
+  QWAVE_SUPPORT_RATE_LIMIT_WINDOW_MS,
+  QWAVE_SUPPORT_RECIPIENTS,
+  QWAVE_SUPPORT_REPORT_SCHEMA_VERSION,
+  QWaveSupportEscalationError,
+  buildQWaveSupportRelayRequest,
+  buildSanitizedQWaveSupportReport,
+  deliverQWaveSupportReport,
+  sanitizeSupportEnvironment,
+  validateQWaveSupportRelayRequest
+} from "./support/qwave-support-escalation.mjs";
 
 export {
   MacOSDesktopVaultAdapter,

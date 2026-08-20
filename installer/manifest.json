@@ -1,0 +1,30 @@
+{
+  "installerVersion": "0.1.0",
+  "setupStateSchemaVersion": 4,
+  "supportedEnvironment": {
+    "platform": "macOS private user account",
+    "conversation": "Codex Desktop",
+    "recommendedModel": "Sol",
+    "languages": ["English", "Spanish"]
+  },
+  "customerOwnership": {
+    "vault": "private and customer-owned",
+    "history": "local-only or verified private remote",
+    "publicVaultRepository": false
+  },
+  "distribution": {
+    "bootstrap": "public MIT source",
+    "runtime": "private QWave Git repository",
+    "runtimeVisibilityReadbackRequiredBeforeClone": true,
+    "remotesConfigured": false
+  },
+  "migration": {
+    "customerKnowledgeSeparated": true,
+    "backupBeforeChangeRequired": true,
+    "rollbackRequired": true
+  },
+  "releaseLimitations": [
+    "No Git remote is configured in this local release candidate.",
+    "Real clean-Mac, live connector, provider delivery, and customer-beta evidence remain separate release gates."
+  ]
+}
