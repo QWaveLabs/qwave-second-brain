@@ -18,10 +18,10 @@ test("the release package points customers to one ordinary-language prompt and r
   ]);
   assert.match(readme, /CUSTOMER_PROMPT\.md/);
   assert.match(prompt, /I want to set up my QWave Second Brain\./);
-  assert.match(readme, /public MIT bootstrap paired with a private\s+QWave runtime/i);
+  assert.match(readme, /first usable handoff is this private QWave repository/i);
   assert.match(prompt, /one question at a time/i);
   assert.match(prompt, /do not ask me to use Terminal or run commands/i);
-  assert.match(readme, /no configured Git remote/i);
+  assert.match(readme, /customer gets\s+repository access and one prompt/i);
   assert.match(license, /^MIT License/m);
   assert.match(notices, /Nate Herk/);
 });
@@ -34,13 +34,12 @@ test("installer diagnostics expose version, supported environment, migration bou
   assert.deepEqual(diagnostic.supportedEnvironment.languages, ["English", "Spanish"]);
   assert.equal(diagnostic.customerOwnership.publicVaultRepository, false);
   assert.deepEqual(diagnostic.distribution, {
-    bootstrap: "public MIT source",
-    runtime: "private QWave Git repository",
-    runtimeVisibilityReadbackRequiredBeforeClone: true,
-    remotesConfigured: false
+    repository: "private QWave Git repository",
+    visibilityReadbackRequiredBeforeClone: true,
+    remotesConfigured: true
   });
   assert.equal(diagnostic.migration.backupBeforeChangeRequired, true);
-  assert.match(diagnostic.releaseLimitations.join(" "), /No Git remote is configured/i);
+  assert.match(diagnostic.releaseLimitations.join(" "), /clean-Mac, live connector, provider delivery/i);
 });
 
 test("the public scrub catches protected runtime artifacts and credential-like files", async () => {

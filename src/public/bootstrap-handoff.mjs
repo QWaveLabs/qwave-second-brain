@@ -1,8 +1,8 @@
 /**
  * QWA-144 customer bootstrap handoff.
  *
- * The approved release model is a public MIT bootstrap paired with a private
- * QWave runtime. This boundary makes the private-runtime clone handoff safe
+ * The approved release model is one private QWave repository. This boundary
+ * makes the private-repository clone handoff safe
  * and resumable before Setup Session begins; the customer never receives a
  * terminal procedure.
  */
@@ -11,9 +11,7 @@ export const QWAVE_INSTALLER_VERSION = "0.1.0";
 
 export const DISTRIBUTION_VISIBILITIES = Object.freeze(["public", "private"]);
 export const QWAVE_DISTRIBUTION = Object.freeze({
-  bootstrapVisibility: "public",
-  bootstrapLicense: "MIT",
-  runtimeVisibility: "private"
+  repositoryVisibility: "private"
 });
 
 export const BOOTSTRAP_CAPABILITIES = Object.freeze([
@@ -128,7 +126,7 @@ export function buildCustomerBootstrapPrompt({ language = "en", repositoryRefere
 export async function prepareBootstrapHandoff({
   message,
   repository,
-  requiredVisibility = QWAVE_DISTRIBUTION.runtimeVisibility,
+  requiredVisibility = QWAVE_DISTRIBUTION.repositoryVisibility,
   language = "en"
 } = {}) {
   assertBootstrapIntent(message);

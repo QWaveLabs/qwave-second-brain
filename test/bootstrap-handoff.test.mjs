@@ -50,9 +50,7 @@ test("the customer bootstrap prompt is one normal-language request with the requ
   assert.doesNotMatch(prompt, /^\//m);
   assert.equal(QWAVE_INSTALLER_VERSION, "0.1.0");
   assert.deepEqual(QWAVE_DISTRIBUTION, {
-    bootstrapVisibility: "public",
-    bootstrapLicense: "MIT",
-    runtimeVisibility: "private"
+    repositoryVisibility: "private"
   });
   assert.deepEqual(BOOTSTRAP_CAPABILITIES, [
     "set up", "connect", "review privacy", "build", "refresh", "audit", "show", "restore", "improve"

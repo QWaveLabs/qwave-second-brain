@@ -13,10 +13,9 @@
     "publicVaultRepository": false
   },
   "distribution": {
-    "bootstrap": "public MIT source",
-    "runtime": "private QWave Git repository",
-    "runtimeVisibilityReadbackRequiredBeforeClone": true,
-    "remotesConfigured": false
+    "repository": "private QWave Git repository",
+    "visibilityReadbackRequiredBeforeClone": true,
+    "remotesConfigured": true
   },
   "migration": {
     "customerKnowledgeSeparated": true,
@@ -24,7 +23,6 @@
     "rollbackRequired": true
   },
   "releaseLimitations": [
-    "No Git remote is configured in this local release candidate.",
     "Real clean-Mac, live connector, provider delivery, and customer-beta evidence remain separate release gates."
   ]
 }

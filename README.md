@@ -12,8 +12,8 @@ or resumes the guided setup. The customer never needs Terminal or commands.
 
 ## What this package is
 
-- A public, QWave-branded, MIT-licensed bootstrap and natural-language operating guide.
-- A separate private QWave runtime that Codex may clone only after visibility readback.
+- A private, QWave-branded repository and natural-language operating guide.
+- A private QWave runtime that Codex may clone only after visibility readback.
 - A guide for a separate, private customer vault on the Desktop.
 - A release candidate with a resumable bootstrap handoff and Setup Session API.
 
@@ -22,11 +22,10 @@ vault repository, or real-time background capture product.
 
 ## Current release boundary
 
-The approved distribution is a public MIT bootstrap paired with a private
-QWave runtime. Customer vault history remains local-only or uses a verified
-private remote. This local release candidate has no configured Git remote, so
-no public bootstrap or private runtime has been published and no customer clone
-access exists yet.
+The first usable handoff is this private QWave repository. The customer gets
+repository access and one prompt; no separate public bootstrap is needed for
+that flow. Customer vault history remains local-only or uses a verified private
+remote.
 
 ## Supported environment and diagnostics
 
