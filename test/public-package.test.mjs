@@ -9,7 +9,7 @@ import { scanPublicTree } from "../scripts/public-scrub.mjs";
 
 const root = path.resolve(import.meta.dirname, "..");
 
-test("the release package points customers to one ordinary-language prompt and records its limits", async () => {
+test("the public package explains the customer journey, privacy boundary, and release limits", async () => {
   const [readme, prompt, license, notices] = await Promise.all([
     (await import("node:fs/promises")).readFile(path.join(root, "README.md"), "utf8"),
     (await import("node:fs/promises")).readFile(path.join(root, "CUSTOMER_PROMPT.md"), "utf8"),
@@ -18,10 +18,18 @@ test("the release package points customers to one ordinary-language prompt and r
   ]);
   assert.match(readme, /CUSTOMER_PROMPT\.md/);
   assert.match(prompt, /I want to set up my QWave Second Brain\./);
-  assert.match(readme, /first usable handoff is this public QWave repository/i);
+  assert.match(readme, /public setup repository is live/i);
+  assert.match(readme, /## Why this exists/);
+  assert.match(readme, /## How the system behaves/);
+  assert.match(readme, /## Privacy model/);
+  assert.match(readme, /## Sources and connectors: current truth/);
+  assert.match(readme, /## Vault ownership, history, and backups/);
+  assert.match(readme, /## Current release boundary/);
+  assert.match(readme, /does \*\*not\*\* yet prove a finished backup, restore, or\s+clean-Mac recovery journey/i);
+  assert.match(readme, /production-ready testing candidate, not a proven production customer rollout/i);
   assert.match(prompt, /one question at a time/i);
   assert.match(prompt, /do not ask me to use Terminal or run commands/i);
-  assert.match(readme, /one prompt; no\s+repository invitation/i);
+  assert.match(readme, /one normal-language prompt/i);
   assert.match(license, /^MIT License/m);
   assert.match(notices, /Nate Herk/);
 });
